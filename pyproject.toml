@@ -1,4 +1,7 @@
 [project]
+name = "colab-env"
+version = "0.0.1"
+requires-python = ">=3.10"
 dependencies = [
     "paddlepaddle-gpu",
     "paddleocr",
