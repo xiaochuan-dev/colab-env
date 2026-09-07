@@ -13,3 +13,4 @@ paddlepaddle-gpu = { index = "paddle-cu130" }
 [[tool.uv.index]]
 name = "paddle-cu130"
 url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+explicit = true
