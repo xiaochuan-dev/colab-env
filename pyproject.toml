@@ -5,6 +5,7 @@ requires-python = ">=3.10"
 dependencies = [
     "paddlepaddle-gpu",
     "paddleocr",
+    "paddlex[ocr]==3.7.2",
 ]
 
 [tool.uv.sources]
