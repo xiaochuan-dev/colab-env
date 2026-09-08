@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataset import Im2LatexHF, download_im2latex100k, collate_fn
@@ -17,10 +17,12 @@ from vocab import Vocab, build_vocab_from_formulas
 # ============================================================
 
 DATASET_NAME = "yuntian-deng/im2latex-100k"
+
 DATA_CACHE_DIR = Path("./data/huggingface")
 OUTPUT_DIR = Path("./checkpoints/lgp")
 
 EPOCHS = 25
+
 BATCH_SIZE = 64
 NUM_WORKERS = 2
 
@@ -28,10 +30,12 @@ LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
 
 MAX_LEN = 150
+
 IMAGE_HEIGHT = 128
 MAX_IMAGE_WIDTH = 800
 
 MIN_TOKEN_FREQ = 1
+
 SEED = 42
 
 MODEL_DIM = 256
@@ -39,6 +43,22 @@ NUM_HEADS = 8
 DECODER_DEPTH = 3
 
 GRAD_CLIP = 5.0
+
+# ------------------------------------------------------------
+# Autoregressive validation
+#
+# 不需要每个 epoch 对整个验证集做 generate。
+# 固定使用前 N 个验证样本计算真实自回归准确率。
+#
+# 如果你想更准确，可以改成 2000 / 5000。
+# 如果想更快，可以改成 500。
+# ------------------------------------------------------------
+GEN_EVAL_SAMPLES = 1000
+
+# ------------------------------------------------------------
+# 自回归生成最多生成多少 token
+# ------------------------------------------------------------
+GEN_MAX_LEN = MAX_LEN
 
 # Set a checkpoint path to resume, otherwise None.
 RESUME_CHECKPOINT = None
@@ -51,8 +71,12 @@ RESUME_CHECKPOINT = None
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = True
 
 
 # ============================================================
@@ -137,16 +161,16 @@ def make_loader(split, vocab, shuffle):
         max_width=MAX_IMAGE_WIDTH,
     )
 
-    loader_kwargs = dict(
-        batch_size=BATCH_SIZE,
-        shuffle=shuffle,
-        num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=lambda batch: collate_fn(
+    loader_kwargs = {
+        "batch_size": BATCH_SIZE,
+        "shuffle": shuffle,
+        "num_workers": NUM_WORKERS,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": lambda batch: collate_fn(
             batch,
             vocab.pad_id,
         ),
-    )
+    }
 
     if NUM_WORKERS > 0:
         loader_kwargs["persistent_workers"] = True
@@ -171,15 +195,21 @@ def compute_loss(logits, targets, pad_id):
 
 
 # ============================================================
-# Teacher-forced validation
+# Validation
 #
-# Returns:
-#   val_loss
-#   token_accuracy
+# val_loss + token accuracy
+#
+# 这个是 Teacher Forcing。
+# 整个序列一次性并行计算，因此很快。
 # ============================================================
 
 @torch.no_grad()
-def evaluate(model, loader, pad_id, device):
+def evaluate(
+    model,
+    loader,
+    pad_id,
+    device,
+):
     model.eval()
 
     total_loss = 0.0
@@ -199,7 +229,10 @@ def evaluate(model, loader, pad_id, device):
             non_blocking=True,
         )
 
+        # ----------------------------------------------------
         # Teacher forcing
+        # ----------------------------------------------------
+
         decoder_input = tokens[:, :-1]
         targets = tokens[:, 1:]
 
@@ -214,6 +247,10 @@ def evaluate(model, loader, pad_id, device):
             pad_id,
         )
 
+        # ----------------------------------------------------
+        # Token accuracy
+        # ----------------------------------------------------
+
         predictions = logits.argmax(dim=-1)
 
         mask = targets != pad_id
@@ -224,6 +261,10 @@ def evaluate(model, loader, pad_id, device):
 
         correct_tokens += correct.sum().item()
         total_tokens += mask.sum().item()
+
+        # ----------------------------------------------------
+        # Loss
+        # ----------------------------------------------------
 
         batch_size = images.size(0)
 
@@ -250,7 +291,10 @@ def evaluate(model, loader, pad_id, device):
 # ============================================================
 # Teacher-forced sequence accuracy
 #
-# This is NOT autoregressive generation accuracy.
+# 注意：
+# 这个不是论文意义上的真实 autoregressive accuracy。
+#
+# 它使用 ground-truth prefix。
 # ============================================================
 
 @torch.no_grad()
@@ -286,8 +330,6 @@ def evaluate_teacher_forced_sequence_accuracy(
 
         predictions = logits.argmax(dim=-1)
 
-        # A sequence is correct only if every
-        # non-PAD token is correct.
         mask = targets != pad_id
 
         sequence_correct = (
@@ -308,19 +350,120 @@ def evaluate_teacher_forced_sequence_accuracy(
 
 
 # ============================================================
-# Autoregressive generation sequence accuracy
+# Autoregressive generation
 #
-# This is the important metric.
+# 这个函数专门用于验证。
 #
-# image
+# 注意：
+# 这里仍然是标准 autoregressive decoding。
+#
+# [BOS]
 #   ↓
-# model predicts token
+# [BOS, y1]
 #   ↓
-# predicted token is fed back
-#   ↓
-# model predicts next token
+# [BOS, y1, y2]
 #   ↓
 # ...
+#
+# 但会使用 finished mask：
+#
+# 某个样本已经 EOS 后，就不再继续生成有效 token。
+# ============================================================
+
+@torch.no_grad()
+def generate_batch(
+    model,
+    images,
+    bos_id,
+    eos_id,
+    max_len,
+):
+    model.eval()
+
+    batch_size = images.size(0)
+
+    memory, grid_h, grid_w = model.encode(images)
+
+    ids = torch.full(
+        (
+            batch_size,
+            1,
+        ),
+        bos_id,
+        device=images.device,
+        dtype=torch.long,
+    )
+
+    finished = torch.zeros(
+        batch_size,
+        device=images.device,
+        dtype=torch.bool,
+    )
+
+    for _ in range(max_len - 1):
+
+        hidden, _, _ = model.decode_hidden(
+            ids,
+            memory,
+            grid_h,
+            grid_w,
+        )
+
+        logits = model.head(
+            hidden[:, -1]
+        )
+
+        next_token = logits.argmax(
+            dim=-1
+        )
+
+        # ----------------------------------------------------
+        # 已经结束的样本强制保持 EOS
+        # ----------------------------------------------------
+
+        next_token = torch.where(
+            finished,
+            torch.full_like(
+                next_token,
+                eos_id,
+            ),
+            next_token,
+        )
+
+        ids = torch.cat(
+            [
+                ids,
+                next_token.unsqueeze(1),
+            ],
+            dim=1,
+        )
+
+        # ----------------------------------------------------
+        # 更新 finished
+        # ----------------------------------------------------
+
+        finished |= (
+            next_token == eos_id
+        )
+
+        # ----------------------------------------------------
+        # 整个 batch 都 EOS
+        # 立即停止
+        # ----------------------------------------------------
+
+        if finished.all():
+            break
+
+    return ids
+
+
+# ============================================================
+# Autoregressive sequence accuracy
+#
+# 只在固定的 GEN_EVAL_SAMPLES 上测试。
+#
+# 这样每个 epoch 不会因为整个 validation set 的
+# autoregressive decoding 耗费大量时间。
 # ============================================================
 
 @torch.no_grad()
@@ -329,17 +472,43 @@ def evaluate_generation_sequence_accuracy(
     loader,
     vocab,
     device,
+    max_samples=GEN_EVAL_SAMPLES,
 ):
     model.eval()
 
     correct_sequences = 0
     total_sequences = 0
 
-    for images, tokens, _, _ in tqdm(
+    processed_samples = 0
+
+    progress = tqdm(
         loader,
         desc="Generating validation",
         leave=False,
-    ):
+    )
+
+    for images, tokens, _, _ in progress:
+
+        # ----------------------------------------------------
+        # 如果已经达到验证数量，停止
+        # ----------------------------------------------------
+
+        if processed_samples >= max_samples:
+            break
+
+        remaining = (
+            max_samples -
+            processed_samples
+        )
+
+        # ----------------------------------------------------
+        # 最后一批只取需要的数量
+        # ----------------------------------------------------
+
+        if images.size(0) > remaining:
+            images = images[:remaining]
+            tokens = tokens[:remaining]
+
         images = images.to(
             device,
             non_blocking=True,
@@ -354,11 +523,12 @@ def evaluate_generation_sequence_accuracy(
         # Real autoregressive generation
         # ----------------------------------------------------
 
-        generated = model.generate(
-            images,
+        generated = generate_batch(
+            model=model,
+            images=images,
             bos_id=vocab.bos_id,
             eos_id=vocab.eos_id,
-            max_len=MAX_LEN,
+            max_len=max_len,
         )
 
         # generated:
@@ -368,15 +538,18 @@ def evaluate_generation_sequence_accuracy(
         # Ground truth:
         #
         # [BOS, token1, token2, ..., EOS, PAD, PAD]
-        #
-        # Remove BOS.
-        generated = generated[:, 1:]
 
+        generated = generated[:, 1:]
         targets = tokens[:, 1:]
 
         batch_size = tokens.size(0)
 
+        # ----------------------------------------------------
+        # Compare each sample
+        # ----------------------------------------------------
+
         for i in range(batch_size):
+
             pred = generated[i]
             target = targets[i]
 
@@ -395,7 +568,6 @@ def evaluate_generation_sequence_accuracy(
                     eos_positions[0].item() + 1
                 )
             else:
-                # No EOS: use non-PAD length
                 valid_positions = (
                     target != vocab.pad_id
                 ).nonzero(
@@ -406,7 +578,8 @@ def evaluate_generation_sequence_accuracy(
                     target_end = 0
                 else:
                     target_end = (
-                        valid_positions[-1].item() + 1
+                        valid_positions[-1].item()
+                        + 1
                     )
 
             target = target[:target_end]
@@ -423,7 +596,8 @@ def evaluate_generation_sequence_accuracy(
 
             if pred_eos_positions.numel() > 0:
                 pred_end = (
-                    pred_eos_positions[0].item() + 1
+                    pred_eos_positions[0].item()
+                    + 1
                 )
 
                 pred = pred[:pred_end]
@@ -432,10 +606,19 @@ def evaluate_generation_sequence_accuracy(
             # Exact sequence match
             # ------------------------------------------------
 
-            if torch.equal(pred, target):
+            if torch.equal(
+                pred,
+                target,
+            ):
                 correct_sequences += 1
 
             total_sequences += 1
+
+        processed_samples += batch_size
+
+        progress.set_postfix(
+            samples=processed_samples,
+        )
 
     return (
         correct_sequences /
@@ -481,6 +664,7 @@ def save_checkpoint(
 # ============================================================
 
 def main():
+
     set_seed(SEED)
 
     OUTPUT_DIR.mkdir(
@@ -499,15 +683,21 @@ def main():
         else "cpu"
     )
 
-    print(f"Device: {device}")
-    print(f"Dataset: {DATASET_NAME}")
+    print(
+        f"Device: {device}"
+    )
+
+    print(
+        f"Dataset: {DATASET_NAME}"
+    )
+
     print(
         f"Cache: {DATA_CACHE_DIR.resolve()}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Dataset
-    # --------------------------------------------------------
+    # ========================================================
 
     dataset = download_im2latex100k()
 
@@ -525,9 +715,9 @@ def main():
         f"Validation samples: {len(val_split):,}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Vocabulary
-    # --------------------------------------------------------
+    # ========================================================
 
     vocab = build_or_load_vocab(
         train_split
@@ -537,9 +727,9 @@ def main():
         f"Vocabulary size: {len(vocab):,}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DataLoader
-    # --------------------------------------------------------
+    # ========================================================
 
     train_loader = make_loader(
         train_split,
@@ -553,11 +743,13 @@ def main():
         shuffle=False,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Model
-    # --------------------------------------------------------
+    # ========================================================
 
-    entity_ids = make_entity_ids(vocab)
+    entity_ids = make_entity_ids(
+        vocab
+    )
 
     model = SpatialHMER(
         vocab_size=len(vocab),
@@ -574,9 +766,9 @@ def main():
         f"{sum(p.numel() for p in model.parameters()):,}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Optimizer
-    # --------------------------------------------------------
+    # ========================================================
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -591,15 +783,17 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Resume
-    # --------------------------------------------------------
+    # ========================================================
 
     start_epoch = 0
+
     best_val = float("inf")
     best_acc = 0.0
 
     if RESUME_CHECKPOINT:
+
         checkpoint_path = Path(
             RESUME_CHECKPOINT
         )
@@ -650,6 +844,7 @@ def main():
         start_epoch,
         EPOCHS,
     ):
+
         model.train()
 
         running_loss = 0.0
@@ -663,11 +858,12 @@ def main():
             ),
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Train
-        # ----------------------------------------------------
+        # ====================================================
 
         for images, tokens, _, _ in progress:
+
             images = images.to(
                 device,
                 non_blocking=True,
@@ -681,6 +877,10 @@ def main():
             optimizer.zero_grad(
                 set_to_none=True
             )
+
+            # ------------------------------------------------
+            # Teacher forcing
+            # ------------------------------------------------
 
             decoder_input = tokens[:, :-1]
             targets = tokens[:, 1:]
@@ -696,6 +896,10 @@ def main():
                 vocab.pad_id,
             )
 
+            # ------------------------------------------------
+            # Backward
+            # ------------------------------------------------
+
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -705,10 +909,15 @@ def main():
 
             optimizer.step()
 
+            # ------------------------------------------------
+            # Statistics
+            # ------------------------------------------------
+
             batch_size = images.size(0)
 
             running_loss += (
-                loss.item() * batch_size
+                loss.item()
+                * batch_size
             )
 
             sample_count += batch_size
@@ -717,6 +926,10 @@ def main():
                 loss=f"{loss.item():.4f}"
             )
 
+        # ====================================================
+        # Scheduler
+        # ====================================================
+
         scheduler.step()
 
         train_loss = (
@@ -724,10 +937,14 @@ def main():
             max(sample_count, 1)
         )
 
-        # ----------------------------------------------------
-        # Validation 1:
-        # loss + token accuracy
-        # ----------------------------------------------------
+        # ====================================================
+        # Validation 1
+        #
+        # Full validation:
+        #
+        # val_loss
+        # token_acc
+        # ====================================================
 
         val_loss, token_acc = evaluate(
             model,
@@ -736,10 +953,13 @@ def main():
             device,
         )
 
-        # ----------------------------------------------------
-        # Validation 2:
-        # teacher-forced sequence accuracy
-        # ----------------------------------------------------
+        # ====================================================
+        # Validation 2
+        #
+        # Full validation:
+        #
+        # Teacher-forced sequence accuracy
+        # ====================================================
 
         tf_seq_acc = (
             evaluate_teacher_forced_sequence_accuracy(
@@ -750,10 +970,13 @@ def main():
             )
         )
 
-        # ----------------------------------------------------
-        # Validation 3:
-        # real autoregressive sequence accuracy
-        # ----------------------------------------------------
+        # ====================================================
+        # Validation 3
+        #
+        # Real autoregressive generation
+        #
+        # 只使用 GEN_EVAL_SAMPLES
+        # ====================================================
 
         gen_seq_acc = (
             evaluate_generation_sequence_accuracy(
@@ -761,44 +984,64 @@ def main():
                 val_loader,
                 vocab,
                 device,
+                max_samples=GEN_EVAL_SAMPLES,
             )
         )
 
+        # ====================================================
+        # Learning rate
+        # ====================================================
+
         lr = scheduler.get_last_lr()[0]
 
-        # ----------------------------------------------------
-        # Print all metrics
-        # ----------------------------------------------------
+        # ====================================================
+        # Print metrics
+        # ====================================================
 
         print()
-        print("=" * 80)
+
+        print(
+            "=" * 80
+        )
+
         print(
             f"Epoch {epoch + 1}/{EPOCHS}"
         )
+
         print(
             f"train_loss : {train_loss:.5f}"
         )
+
         print(
             f"val_loss   : {val_loss:.5f}"
         )
+
         print(
             f"token_acc  : {token_acc:.2f}%"
         )
+
         print(
             f"tf_seq_acc : {tf_seq_acc:.2f}%"
         )
+
         print(
-            f"gen_seq_acc: {gen_seq_acc:.2f}%"
+            f"gen_seq_acc: {gen_seq_acc:.2f}% "
+            f"(first {GEN_EVAL_SAMPLES} samples)"
         )
+
         print(
             f"lr         : {lr:.3e}"
         )
-        print("=" * 80)
+
+        print(
+            "=" * 80
+        )
+
         print()
 
-        # ----------------------------------------------------
+        # ====================================================
         # Save last checkpoint
-        # ----------------------------------------------------
+        # ====================================================
 
         save_checkpoint(
             OUTPUT_DIR / "last.pt",
@@ -810,11 +1053,12 @@ def main():
             best_acc,
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Best validation loss
-        # ----------------------------------------------------
+        # ====================================================
 
         if val_loss < best_val:
+
             best_val = val_loss
 
             save_checkpoint(
@@ -828,15 +1072,16 @@ def main():
             )
 
             print(
-                f"Saved best loss checkpoint: "
+                "Saved best loss checkpoint: "
                 f"{OUTPUT_DIR / 'best_loss.pt'}"
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Best generation accuracy
-        # ----------------------------------------------------
+        # ====================================================
 
         if gen_seq_acc > best_acc:
+
             best_acc = gen_seq_acc
 
             save_checkpoint(
@@ -850,21 +1095,35 @@ def main():
             )
 
             print(
-                f"Saved best generation accuracy checkpoint: "
+                "Saved best generation accuracy checkpoint: "
                 f"{OUTPUT_DIR / 'best_acc.pt'}"
             )
 
+    # ========================================================
+    # Finished
+    # ========================================================
+
     print()
-    print("Training finished.")
+
+    print(
+        "Training finished."
+    )
+
     print(
         f"Best loss checkpoint: "
         f"{OUTPUT_DIR / 'best_loss.pt'}"
     )
+
     print(
         f"Best generation accuracy checkpoint: "
         f"{OUTPUT_DIR / 'best_acc.pt'}"
     )
 
 
+# ============================================================
+# Entry
+# ============================================================
+
 if __name__ == "__main__":
     main()
+
