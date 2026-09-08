@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import Im2LatexHF, download_im2latex100k, collate_fn
@@ -44,23 +44,28 @@ DECODER_DEPTH = 3
 
 GRAD_CLIP = 5.0
 
-# ------------------------------------------------------------
+# ============================================================
 # Autoregressive validation
 #
-# 不需要每个 epoch 对整个验证集做 generate。
-# 固定使用前 N 个验证样本计算真实自回归准确率。
+# 每个 epoch 只对固定数量的样本做真正的 autoregressive
+# generation。
 #
-# 如果你想更准确，可以改成 2000 / 5000。
-# 如果想更快，可以改成 500。
-# ------------------------------------------------------------
-GEN_EVAL_SAMPLES = 1000
+# 500:
+#   速度较快
+#
+# 1000:
+#   更稳定
+#
+# 5000:
+#   更准确，但明显更慢
+# ============================================================
 
-# ------------------------------------------------------------
-# 自回归生成最多生成多少 token
-# ------------------------------------------------------------
+GEN_EVAL_SAMPLES = 500
+
 GEN_MAX_LEN = MAX_LEN
 
-# Set a checkpoint path to resume, otherwise None.
+# 设置 checkpoint 路径可以继续训练
+# None 表示从头开始
 RESUME_CHECKPOINT = None
 
 
@@ -75,7 +80,8 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    if torch.backends.cudnn.is_available():
+    # 对固定尺寸/类似尺寸的 CNN 输入通常更快
+    if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
 
 
@@ -91,7 +97,8 @@ def choose_validation_split(dataset):
         return dataset["validation"]
 
     raise KeyError(
-        f"Cannot find validation split. Available: {list(dataset.keys())}"
+        "Cannot find validation split. "
+        f"Available: {list(dataset.keys())}"
     )
 
 
@@ -99,13 +106,20 @@ def build_or_load_vocab(train_split):
     vocab_path = OUTPUT_DIR / "vocab.json"
 
     if vocab_path.exists():
-        print(f"Loading vocabulary: {vocab_path}")
+        print(
+            f"Loading vocabulary: {vocab_path}"
+        )
         return Vocab.load(vocab_path)
 
-    print("Building vocabulary from training formulas...")
+    print(
+        "Building vocabulary from training formulas..."
+    )
 
     vocab = build_vocab_from_formulas(
-        (str(row["formula"]) for row in train_split),
+        (
+            str(row["formula"])
+            for row in train_split
+        ),
         min_freq=MIN_TOKEN_FREQ,
     )
 
@@ -140,19 +154,29 @@ def make_entity_ids(vocab):
         "<unk>",
     }
 
-    return [
-        token_id
-        for token, token_id in vocab.stoi.items()
-        if token not in structural_tokens
-        and token not in special_tokens
-    ]
+    entity_ids = []
+
+    for token, token_id in vocab.stoi.items():
+        if token in structural_tokens:
+            continue
+
+        if token in special_tokens:
+            continue
+
+        entity_ids.append(token_id)
+
+    return entity_ids
 
 
 # ============================================================
 # DataLoader
 # ============================================================
 
-def make_loader(split, vocab, shuffle):
+def make_loader(
+    split,
+    vocab,
+    shuffle,
+):
     dataset = Im2LatexHF(
         split,
         vocab,
@@ -186,9 +210,16 @@ def make_loader(split, vocab, shuffle):
 # Loss
 # ============================================================
 
-def compute_loss(logits, targets, pad_id):
+def compute_loss(
+    logits,
+    targets,
+    pad_id,
+):
     return F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
+        logits.reshape(
+            -1,
+            logits.size(-1),
+        ),
         targets.reshape(-1),
         ignore_index=pad_id,
     )
@@ -197,10 +228,14 @@ def compute_loss(logits, targets, pad_id):
 # ============================================================
 # Validation
 #
-# val_loss + token accuracy
+# 一次 forward 同时计算：
 #
-# 这个是 Teacher Forcing。
-# 整个序列一次性并行计算，因此很快。
+#   1. val_loss
+#   2. token_acc
+#   3. tf_seq_acc
+#
+# 原来的代码这里实际上跑了两遍 validation。
+# 现在合并成一遍。
 # ============================================================
 
 @torch.no_grad()
@@ -218,7 +253,17 @@ def evaluate(
     total_tokens = 0
     correct_tokens = 0
 
-    for images, tokens, _, _ in loader:
+    correct_sequences = 0
+    total_sequences = 0
+
+    progress = tqdm(
+        loader,
+        desc="Validation",
+        leave=False,
+    )
+
+    for images, tokens, _, _ in progress:
+
         images = images.to(
             device,
             non_blocking=True,
@@ -241,6 +286,10 @@ def evaluate(
             decoder_input,
         )
 
+        # ----------------------------------------------------
+        # Loss
+        # ----------------------------------------------------
+
         loss = compute_loss(
             logits,
             targets,
@@ -248,31 +297,67 @@ def evaluate(
         )
 
         # ----------------------------------------------------
-        # Token accuracy
+        # Prediction
         # ----------------------------------------------------
 
-        predictions = logits.argmax(dim=-1)
+        predictions = logits.argmax(
+            dim=-1
+        )
 
         mask = targets != pad_id
+
+        # ----------------------------------------------------
+        # Token accuracy
+        # ----------------------------------------------------
 
         correct = (
             predictions == targets
         ) & mask
 
-        correct_tokens += correct.sum().item()
-        total_tokens += mask.sum().item()
+        correct_tokens += (
+            correct.sum().item()
+        )
+
+        total_tokens += (
+            mask.sum().item()
+        )
 
         # ----------------------------------------------------
-        # Loss
+        # Teacher-forced sequence accuracy
+        #
+        # 一个序列所有有效 token 都正确，
+        # 才算整个 expression 正确。
+        # ----------------------------------------------------
+
+        sequence_correct = (
+            (predictions == targets)
+            | ~mask
+        ).all(dim=1)
+
+        correct_sequences += (
+            sequence_correct.sum().item()
+        )
+
+        total_sequences += (
+            tokens.size(0)
+        )
+
+        # ----------------------------------------------------
+        # Loss statistics
         # ----------------------------------------------------
 
         batch_size = images.size(0)
 
         total_loss += (
-            loss.item() * batch_size
+            loss.item()
+            * batch_size
         )
 
         total_samples += batch_size
+
+    # ========================================================
+    # Final metrics
+    # ========================================================
 
     avg_loss = (
         total_loss /
@@ -285,89 +370,35 @@ def evaluate(
         * 100.0
     )
 
-    return avg_loss, token_accuracy
-
-
-# ============================================================
-# Teacher-forced sequence accuracy
-#
-# 注意：
-# 这个不是论文意义上的真实 autoregressive accuracy。
-#
-# 它使用 ground-truth prefix。
-# ============================================================
-
-@torch.no_grad()
-def evaluate_teacher_forced_sequence_accuracy(
-    model,
-    loader,
-    pad_id,
-    device,
-):
-    model.eval()
-
-    correct_sequences = 0
-    total_sequences = 0
-
-    for images, tokens, _, _ in loader:
-        images = images.to(
-            device,
-            non_blocking=True,
-        )
-
-        tokens = tokens.to(
-            device,
-            non_blocking=True,
-        )
-
-        decoder_input = tokens[:, :-1]
-        targets = tokens[:, 1:]
-
-        logits, _ = model(
-            images,
-            decoder_input,
-        )
-
-        predictions = logits.argmax(dim=-1)
-
-        mask = targets != pad_id
-
-        sequence_correct = (
-            (predictions == targets) | ~mask
-        ).all(dim=1)
-
-        correct_sequences += (
-            sequence_correct.sum().item()
-        )
-
-        total_sequences += tokens.size(0)
-
-    return (
+    tf_sequence_accuracy = (
         correct_sequences /
         max(total_sequences, 1)
         * 100.0
     )
 
+    return (
+        avg_loss,
+        token_accuracy,
+        tf_sequence_accuracy,
+    )
+
 
 # ============================================================
-# Autoregressive generation
-#
-# 这个函数专门用于验证。
+# Fast autoregressive generation
 #
 # 注意：
-# 这里仍然是标准 autoregressive decoding。
 #
-# [BOS]
-#   ↓
-# [BOS, y1]
-#   ↓
-# [BOS, y1, y2]
-#   ↓
-# ...
+# 这里仍然是 autoregressive。
 #
-# 但会使用 finished mask：
+# 但是 Encoder 只运行一次：
 #
-# 某个样本已经 EOS 后，就不再继续生成有效 token。
+# image
+#   ↓
+# encoder
+#   ↓
+# memory
+#
+# 然后 decoder 才逐 token 生成。
 # ============================================================
 
 @torch.no_grad()
@@ -382,7 +413,17 @@ def generate_batch(
 
     batch_size = images.size(0)
 
-    memory, grid_h, grid_w = model.encode(images)
+    # --------------------------------------------------------
+    # Encoder 只运行一次
+    # --------------------------------------------------------
+
+    memory, grid_h, grid_w = model.encode(
+        images
+    )
+
+    # --------------------------------------------------------
+    # 初始 token
+    # --------------------------------------------------------
 
     ids = torch.full(
         (
@@ -390,15 +431,23 @@ def generate_batch(
             1,
         ),
         bos_id,
-        device=images.device,
         dtype=torch.long,
+        device=images.device,
     )
+
+    # --------------------------------------------------------
+    # 每个样本是否已经结束
+    # --------------------------------------------------------
 
     finished = torch.zeros(
         batch_size,
-        device=images.device,
         dtype=torch.bool,
+        device=images.device,
     )
+
+    # ========================================================
+    # Autoregressive decoding
+    # ========================================================
 
     for _ in range(max_len - 1):
 
@@ -418,7 +467,7 @@ def generate_batch(
         )
 
         # ----------------------------------------------------
-        # 已经结束的样本强制保持 EOS
+        # 已经结束的样本强制 EOS
         # ----------------------------------------------------
 
         next_token = torch.where(
@@ -447,8 +496,7 @@ def generate_batch(
         )
 
         # ----------------------------------------------------
-        # 整个 batch 都 EOS
-        # 立即停止
+        # 整个 batch 都结束
         # ----------------------------------------------------
 
         if finished.all():
@@ -458,12 +506,23 @@ def generate_batch(
 
 
 # ============================================================
-# Autoregressive sequence accuracy
+# Real autoregressive sequence accuracy
 #
-# 只在固定的 GEN_EVAL_SAMPLES 上测试。
+# 只计算 GEN_EVAL_SAMPLES 个样本。
 #
-# 这样每个 epoch 不会因为整个 validation set 的
-# autoregressive decoding 耗费大量时间。
+# 这个指标才是真正的：
+#
+# image
+#   ↓
+# BOS
+#   ↓
+# token1
+#   ↓
+# token2
+#   ↓
+# ...
+#
+# 而不是 teacher forcing。
 # ============================================================
 
 @torch.no_grad()
@@ -472,7 +531,7 @@ def evaluate_generation_sequence_accuracy(
     loader,
     vocab,
     device,
-    max_samples=GEN_EVAL_SAMPLES,
+    max_samples,
 ):
     model.eval()
 
@@ -483,14 +542,16 @@ def evaluate_generation_sequence_accuracy(
 
     progress = tqdm(
         loader,
-        desc="Generating validation",
+        desc=(
+            "Autoregressive validation"
+        ),
         leave=False,
     )
 
     for images, tokens, _, _ in progress:
 
         # ----------------------------------------------------
-        # 如果已经达到验证数量，停止
+        # 达到样本数量后停止
         # ----------------------------------------------------
 
         if processed_samples >= max_samples:
@@ -528,25 +589,22 @@ def evaluate_generation_sequence_accuracy(
             images=images,
             bos_id=vocab.bos_id,
             eos_id=vocab.eos_id,
-            max_len=max_len,
+            max_len=GEN_MAX_LEN,
         )
 
-        # generated:
-        #
-        # [BOS, token1, token2, ..., EOS]
-        #
-        # Ground truth:
-        #
-        # [BOS, token1, token2, ..., EOS, PAD, PAD]
+        # ----------------------------------------------------
+        # Remove BOS
+        # ----------------------------------------------------
 
         generated = generated[:, 1:]
+
         targets = tokens[:, 1:]
 
         batch_size = tokens.size(0)
 
-        # ----------------------------------------------------
-        # Compare each sample
-        # ----------------------------------------------------
+        # ====================================================
+        # Compare every expression
+        # ====================================================
 
         for i in range(batch_size):
 
@@ -554,7 +612,7 @@ def evaluate_generation_sequence_accuracy(
             target = targets[i]
 
             # ------------------------------------------------
-            # Find EOS in target
+            # Target EOS
             # ------------------------------------------------
 
             eos_positions = (
@@ -564,10 +622,14 @@ def evaluate_generation_sequence_accuracy(
             )
 
             if eos_positions.numel() > 0:
+
                 target_end = (
-                    eos_positions[0].item() + 1
+                    eos_positions[0].item()
+                    + 1
                 )
+
             else:
+
                 valid_positions = (
                     target != vocab.pad_id
                 ).nonzero(
@@ -585,7 +647,7 @@ def evaluate_generation_sequence_accuracy(
             target = target[:target_end]
 
             # ------------------------------------------------
-            # Find EOS in prediction
+            # Prediction EOS
             # ------------------------------------------------
 
             pred_eos_positions = (
@@ -595,6 +657,7 @@ def evaluate_generation_sequence_accuracy(
             )
 
             if pred_eos_positions.numel() > 0:
+
                 pred_end = (
                     pred_eos_positions[0].item()
                     + 1
@@ -617,7 +680,7 @@ def evaluate_generation_sequence_accuracy(
         processed_samples += batch_size
 
         progress.set_postfix(
-            samples=processed_samples,
+            samples=processed_samples
         )
 
     return (
@@ -665,7 +728,15 @@ def save_checkpoint(
 
 def main():
 
+    # ========================================================
+    # Seed
+    # ========================================================
+
     set_seed(SEED)
+
+    # ========================================================
+    # Directories
+    # ========================================================
 
     OUTPUT_DIR.mkdir(
         parents=True,
@@ -676,6 +747,10 @@ def main():
         parents=True,
         exist_ok=True,
     )
+
+    # ========================================================
+    # Device
+    # ========================================================
 
     device = torch.device(
         "cuda"
@@ -708,11 +783,13 @@ def main():
     )
 
     print(
-        f"Train samples: {len(train_split):,}"
+        f"Train samples: "
+        f"{len(train_split):,}"
     )
 
     print(
-        f"Validation samples: {len(val_split):,}"
+        f"Validation samples: "
+        f"{len(val_split):,}"
     )
 
     # ========================================================
@@ -724,7 +801,8 @@ def main():
     )
 
     print(
-        f"Vocabulary size: {len(vocab):,}"
+        f"Vocabulary size: "
+        f"{len(vocab):,}"
     )
 
     # ========================================================
@@ -776,6 +854,10 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
 
+    # ========================================================
+    # Scheduler
+    # ========================================================
+
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -817,6 +899,7 @@ def main():
         )
 
         if "scheduler" in checkpoint:
+
             scheduler.load_state_dict(
                 checkpoint["scheduler"]
             )
@@ -850,6 +933,10 @@ def main():
         running_loss = 0.0
         sample_count = 0
 
+        # ====================================================
+        # Train progress
+        # ====================================================
+
         progress = tqdm(
             train_loader,
             desc=(
@@ -859,7 +946,7 @@ def main():
         )
 
         # ====================================================
-        # Train
+        # Training loop
         # ====================================================
 
         for images, tokens, _, _ in progress:
@@ -874,6 +961,10 @@ def main():
                 non_blocking=True,
             )
 
+            # ------------------------------------------------
+            # Clear gradients
+            # ------------------------------------------------
+
             optimizer.zero_grad(
                 set_to_none=True
             )
@@ -883,12 +974,21 @@ def main():
             # ------------------------------------------------
 
             decoder_input = tokens[:, :-1]
+
             targets = tokens[:, 1:]
+
+            # ------------------------------------------------
+            # Forward
+            # ------------------------------------------------
 
             logits, _ = model(
                 images,
                 decoder_input,
             )
+
+            # ------------------------------------------------
+            # Loss
+            # ------------------------------------------------
 
             loss = compute_loss(
                 logits,
@@ -902,10 +1002,18 @@ def main():
 
             loss.backward()
 
+            # ------------------------------------------------
+            # Gradient clipping
+            # ------------------------------------------------
+
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 GRAD_CLIP,
             )
+
+            # ------------------------------------------------
+            # Optimizer
+            # ------------------------------------------------
 
             optimizer.step()
 
@@ -940,13 +1048,20 @@ def main():
         # ====================================================
         # Validation 1
         #
-        # Full validation:
+        # 一次 forward 获得：
         #
-        # val_loss
-        # token_acc
+        #   val_loss
+        #   token_acc
+        #   tf_seq_acc
+        #
+        # 不再重复验证。
         # ====================================================
 
-        val_loss, token_acc = evaluate(
+        (
+            val_loss,
+            token_acc,
+            tf_seq_acc,
+        ) = evaluate(
             model,
             val_loader,
             vocab.pad_id,
@@ -956,34 +1071,17 @@ def main():
         # ====================================================
         # Validation 2
         #
-        # Full validation:
-        #
-        # Teacher-forced sequence accuracy
-        # ====================================================
-
-        tf_seq_acc = (
-            evaluate_teacher_forced_sequence_accuracy(
-                model,
-                val_loader,
-                vocab.pad_id,
-                device,
-            )
-        )
-
-        # ====================================================
-        # Validation 3
-        #
         # Real autoregressive generation
         #
-        # 只使用 GEN_EVAL_SAMPLES
+        # 只测试固定数量样本。
         # ====================================================
 
         gen_seq_acc = (
             evaluate_generation_sequence_accuracy(
-                model,
-                val_loader,
-                vocab,
-                device,
+                model=model,
+                loader=val_loader,
+                vocab=vocab,
+                device=device,
                 max_samples=GEN_EVAL_SAMPLES,
             )
         )
@@ -1077,7 +1175,7 @@ def main():
             )
 
         # ====================================================
-        # Best generation accuracy
+        # Best autoregressive accuracy
         # ====================================================
 
         if gen_seq_acc > best_acc:
@@ -1126,4 +1224,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
