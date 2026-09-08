@@ -127,10 +127,15 @@ def compute_loss(logits, targets, pad_id):
 
 
 @torch.no_grad()
-def evaluate(model, loader, pad_id, device):
+def evaluate(model, loader, pad_id, device, vocab=None):
+    """
+    Evaluate model on validation set, returning both loss and token-level accuracy.
+    """
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    total_tokens = 0
+    correct_tokens = 0
 
     for images, tokens, _, _ in loader:
         images = images.to(device, non_blocking=True)
@@ -139,13 +144,58 @@ def evaluate(model, loader, pad_id, device):
         logits, _ = model(images, tokens[:, :-1])
         loss = compute_loss(logits, tokens[:, 1:], pad_id)
 
+        # Compute token-level accuracy (ignoring padding)
+        predictions = logits.argmax(dim=-1)  # [batch, seq_len]
+        targets = tokens[:, 1:]  # [batch, seq_len]
+        
+        # Create mask for non-padding tokens
+        mask = targets != pad_id
+        correct = (predictions == targets) & mask
+        correct_tokens += correct.sum().item()
+        total_tokens += mask.sum().item()
+
         total_loss += loss.item() * images.size(0)
         total_samples += images.size(0)
 
-    return total_loss / max(total_samples, 1)
+    avg_loss = total_loss / max(total_samples, 1)
+    token_accuracy = correct_tokens / max(total_tokens, 1) * 100.0
+
+    return avg_loss, token_accuracy
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val):
+@torch.no_grad()
+def evaluate_sequence_accuracy(model, loader, pad_id, device, vocab):
+    """
+    Compute sequence-level exact match accuracy.
+    A prediction is correct only if the entire predicted sequence matches the target.
+    """
+    model.eval()
+    correct_sequences = 0
+    total_sequences = 0
+
+    for images, tokens, _, _ in loader:
+        images = images.to(device, non_blocking=True)
+        tokens = tokens.to(device, non_blocking=True)
+
+        logits, _ = model(images, tokens[:, :-1])
+        predictions = logits.argmax(dim=-1)  # [batch, seq_len]
+        targets = tokens[:, 1:]  # [batch, seq_len]
+
+        # For each sequence, check if all non-padding tokens match
+        for pred, target in zip(predictions, targets):
+            # Get valid length (up to first pad token)
+            valid_len = (target != pad_id).sum().item()
+            if valid_len > 0:
+                pred_valid = pred[:valid_len]
+                target_valid = target[:valid_len]
+                if torch.all(pred_valid == target_valid):
+                    correct_sequences += 1
+            total_sequences += 1
+
+    return correct_sequences / max(total_sequences, 1) * 100.0
+
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val, best_acc):
     torch.save(
         {
             "model": model.state_dict(),
@@ -153,6 +203,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val):
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "best_val": best_val,
+            "best_acc": best_acc,
             "config": {
                 "max_len": MAX_LEN,
                 "model_dim": MODEL_DIM,
@@ -210,6 +261,7 @@ def main():
 
     start_epoch = 0
     best_val = float("inf")
+    best_acc = 0.0
 
     if RESUME_CHECKPOINT:
         checkpoint_path = Path(RESUME_CHECKPOINT)
@@ -221,6 +273,7 @@ def main():
             scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint.get("epoch", 0)
         best_val = checkpoint.get("best_val", best_val)
+        best_acc = checkpoint.get("best_acc", best_acc)
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -255,13 +308,19 @@ def main():
         scheduler.step()
 
         train_loss = running_loss / max(sample_count, 1)
-        val_loss = evaluate(model, val_loader, vocab.pad_id, device)
+        
+        # Evaluate on validation set
+        val_loss, token_acc = evaluate(model, val_loader, vocab.pad_id, device)
+        seq_acc = evaluate_sequence_accuracy(model, val_loader, vocab.pad_id, device, vocab)
+        
         lr = scheduler.get_last_lr()[0]
 
         print(
             f"epoch={epoch + 1} "
             f"train_loss={train_loss:.5f} "
             f"val_loss={val_loss:.5f} "
+            f"token_acc={token_acc:.2f}% "
+            f"seq_acc={seq_acc:.2f}% "
             f"lr={lr:.3e}"
         )
 
@@ -272,22 +331,40 @@ def main():
             scheduler,
             epoch + 1,
             best_val,
+            best_acc,
         )
 
+        # Save best checkpoint based on validation loss
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(
-                OUTPUT_DIR / "best.pt",
+                OUTPUT_DIR / "best_loss.pt",
                 model,
                 optimizer,
                 scheduler,
                 epoch + 1,
                 best_val,
+                best_acc,
             )
-            print(f"Saved best checkpoint: {OUTPUT_DIR / 'best.pt'}")
+            print(f"Saved best loss checkpoint: {OUTPUT_DIR / 'best_loss.pt'}")
+
+        # Save best checkpoint based on sequence accuracy
+        if seq_acc > best_acc:
+            best_acc = seq_acc
+            save_checkpoint(
+                OUTPUT_DIR / "best_acc.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch + 1,
+                best_val,
+                best_acc,
+            )
+            print(f"Saved best accuracy checkpoint: {OUTPUT_DIR / 'best_acc.pt'}")
 
     print("Training finished.")
-    print(f"Best checkpoint: {OUTPUT_DIR / 'best.pt'}")
+    print(f"Best loss checkpoint: {OUTPUT_DIR / 'best_loss.pt'}")
+    print(f"Best accuracy checkpoint: {OUTPUT_DIR / 'best_acc.pt'}")
 
 
 if __name__ == "__main__":
