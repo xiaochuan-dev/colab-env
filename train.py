@@ -1,37 +1,51 @@
-import random
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from dataset import Im2LatexHF, download_im2latex100k, collate_fn
+from dataset import (
+    download_im2latex100k,
+    Im2LatexHF,
+    collate_fn,
+)
+
+from vocab import Vocab, tokenize_latex
+
 from model import SpatialHMER
-from vocab import Vocab, build_vocab_from_formulas
 
 
-# ============================================================
-# Configuration
-# ============================================================
+# =========================================================
+# Config
+# =========================================================
 
 DATASET_NAME = "yuntian-deng/im2latex-100k"
 
-DATA_CACHE_DIR = Path("./data/huggingface")
-OUTPUT_DIR = Path("./checkpoints/lgp")
+DATA_CACHE_DIR = Path(
+    "./data/huggingface"
+)
+
+OUTPUT_DIR = Path(
+    "./checkpoints/lgp"
+)
 
 EPOCHS = 25
 
 BATCH_SIZE = 64
+
 NUM_WORKERS = 2
 
 LEARNING_RATE = 3e-4
+
 WEIGHT_DECAY = 1e-4
 
 MAX_LEN = 150
 
 IMAGE_HEIGHT = 128
+
 MAX_IMAGE_WIDTH = 800
 
 MIN_TOKEN_FREQ = 1
@@ -39,230 +53,292 @@ MIN_TOKEN_FREQ = 1
 SEED = 42
 
 MODEL_DIM = 256
+
 NUM_HEADS = 8
+
 DECODER_DEPTH = 3
+
+FF_DIM = 1024
+
+DROPOUT = 0.1
 
 GRAD_CLIP = 5.0
 
-# ============================================================
-# Autoregressive validation
-#
-# 每个 epoch 只对固定数量的样本做真正的 autoregressive
-# generation。
-#
-# 500:
-#   速度较快
-#
-# 1000:
-#   更稳定
-#
-# 5000:
-#   更准确，但明显更慢
-# ============================================================
+RESUME_CHECKPOINT = None
 
 GEN_EVAL_SAMPLES = 500
 
 GEN_MAX_LEN = MAX_LEN
 
-# 设置 checkpoint 路径可以继续训练
-# None 表示从头开始
-RESUME_CHECKPOINT = None
 
+# =========================================================
+# Seed
+# =========================================================
 
-# ============================================================
-# Random seed
-# ============================================================
-
-def set_seed(seed):
+def seed_everything(seed):
     random.seed(seed)
+
     np.random.seed(seed)
 
     torch.manual_seed(seed)
+
     torch.cuda.manual_seed_all(seed)
 
-    # 对固定尺寸/类似尺寸的 CNN 输入通常更快
+
+# =========================================================
+# Device
+# =========================================================
+
+def get_device():
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+        return torch.device("cuda")
+
+    return torch.device("cpu")
 
 
-# ============================================================
-# Dataset
-# ============================================================
+# =========================================================
+# Vocab
+# =========================================================
 
-def choose_validation_split(dataset):
-    if "val" in dataset:
-        return dataset["val"]
+def build_vocab(dataset):
+    formulas = []
 
-    if "validation" in dataset:
-        return dataset["validation"]
+    train_ds = dataset["train"]
 
-    raise KeyError(
-        "Cannot find validation split. "
-        f"Available: {list(dataset.keys())}"
-    )
-
-
-def build_or_load_vocab(train_split):
-    vocab_path = OUTPUT_DIR / "vocab.json"
-
-    if vocab_path.exists():
-        print(
-            f"Loading vocabulary: {vocab_path}"
+    for row in train_ds:
+        formulas.append(
+            str(
+                row["formula"]
+            ).strip()
         )
-        return Vocab.load(vocab_path)
 
-    print(
-        "Building vocabulary from training formulas..."
-    )
-
-    vocab = build_vocab_from_formulas(
-        (
-            str(row["formula"])
-            for row in train_split
-        ),
+    vocab = Vocab.build(
+        formulas,
         min_freq=MIN_TOKEN_FREQ,
     )
-
-    vocab.save(vocab_path)
 
     return vocab
 
 
-# ============================================================
-# Entity tokens
-# ============================================================
-
-def make_entity_ids(vocab):
-    structural_tokens = {
-        "{",
-        "}",
-        "^",
-        "_",
-        r"\frac",
-        r"\sqrt",
-        r"\left",
-        r"\right",
-        r"\begin",
-        r"\end",
-        r"\over",
-    }
-
-    special_tokens = {
-        "<pad>",
-        "<bos>",
-        "<eos>",
-        "<unk>",
-    }
-
-    entity_ids = []
-
-    for token, token_id in vocab.stoi.items():
-        if token in structural_tokens:
-            continue
-
-        if token in special_tokens:
-            continue
-
-        entity_ids.append(token_id)
-
-    return entity_ids
-
-
-# ============================================================
-# DataLoader
-# ============================================================
-
-def make_loader(
-    split,
-    vocab,
-    shuffle,
-):
-    dataset = Im2LatexHF(
-        split,
-        vocab,
-        max_len=MAX_LEN,
-        image_height=IMAGE_HEIGHT,
-        max_width=MAX_IMAGE_WIDTH,
-    )
-
-    loader_kwargs = {
-        "batch_size": BATCH_SIZE,
-        "shuffle": shuffle,
-        "num_workers": NUM_WORKERS,
-        "pin_memory": torch.cuda.is_available(),
-        "collate_fn": lambda batch: collate_fn(
-            batch,
-            vocab.pad_id,
-        ),
-    }
-
-    if NUM_WORKERS > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
-
-    return DataLoader(
-        dataset,
-        **loader_kwargs,
-    )
-
-
-# ============================================================
+# =========================================================
 # Loss
-# ============================================================
+# =========================================================
 
 def compute_loss(
     logits,
     targets,
     pad_id,
 ):
+    """
+    logits:
+        [B, T, V]
+
+    targets:
+        [B, T]
+    """
+
     return F.cross_entropy(
         logits.reshape(
             -1,
-            logits.size(-1),
+            logits.shape[-1],
         ),
         targets.reshape(-1),
         ignore_index=pad_id,
+        label_smoothing=0.0,
     )
 
 
-# ============================================================
-# Validation
-#
-# 一次 forward 同时计算：
-#
-#   1. val_loss
-#   2. token_acc
-#   3. tf_seq_acc
-#
-# 原来的代码这里实际上跑了两遍 validation。
-# 现在合并成一遍。
-# ============================================================
+# =========================================================
+# Teacher forcing metrics
+# =========================================================
+
+def teacher_forcing_metrics(
+    logits,
+    targets,
+    pad_id,
+):
+    predictions = logits.argmax(
+        dim=-1
+    )
+
+    mask = (
+        targets != pad_id
+    )
+
+    correct = (
+        predictions == targets
+    ) & mask
+
+    total_tokens = mask.sum().item()
+
+    correct_tokens = correct.sum().item()
+
+    token_acc = (
+        correct_tokens
+        / max(total_tokens, 1)
+    )
+
+    sequence_correct = (
+        (predictions == targets)
+        | (~mask)
+    ).all(
+        dim=1
+    )
+
+    seq_acc = (
+        sequence_correct.float()
+        .mean()
+        .item()
+    )
+
+    return (
+        token_acc,
+        seq_acc,
+    )
+
+
+# =========================================================
+# Sequence normalize
+# =========================================================
+
+def strip_sequence(
+    ids,
+    bos_id,
+    eos_id,
+    pad_id,
+):
+    result = []
+
+    for token in ids:
+        token = int(token)
+
+        if token == bos_id:
+            continue
+
+        if token == eos_id:
+            result.append(
+                token
+            )
+            break
+
+        if token == pad_id:
+            break
+
+        result.append(
+            token
+        )
+
+    return result
+
+
+# =========================================================
+# Edit distance
+# =========================================================
+
+def edit_distance(
+    a,
+    b,
+):
+    """
+    Levenshtein distance
+    """
+
+    n = len(a)
+    m = len(b)
+
+    if n == 0:
+        return m
+
+    if m == 0:
+        return n
+
+    prev = list(
+        range(m + 1)
+    )
+
+    for i in range(
+        1,
+        n + 1,
+    ):
+        cur = [
+            i
+        ]
+
+        for j in range(
+            1,
+            m + 1,
+        ):
+            if a[i - 1] == b[j - 1]:
+                cost = 0
+            else:
+                cost = 1
+
+            cur.append(
+                min(
+                    cur[j - 1] + 1,
+                    prev[j] + 1,
+                    prev[j - 1] + cost,
+                )
+            )
+
+        prev = cur
+
+    return prev[-1]
+
+
+# =========================================================
+# Generation evaluation
+# =========================================================
 
 @torch.no_grad()
-def evaluate(
+def evaluate_generation(
     model,
     loader,
-    pad_id,
     device,
+    vocab,
+    max_samples=500,
 ):
     model.eval()
 
-    total_loss = 0.0
-    total_samples = 0
+    exact = 0
 
-    total_tokens = 0
-    correct_tokens = 0
+    total = 0
 
-    correct_sequences = 0
-    total_sequences = 0
+    total_distance = 0
 
-    progress = tqdm(
-        loader,
-        desc="Validation",
-        leave=False,
-    )
+    total_ref_length = 0
 
-    for images, tokens, _, _ in progress:
+    le1 = 0
+
+    le2 = 0
+
+    for (
+        images,
+        tokens,
+        image_mask,
+        token_mask,
+        formulas,
+    ) in loader:
+
+        if total >= max_samples:
+            break
+
+        remaining = (
+            max_samples - total
+        )
+
+        if images.shape[0] > remaining:
+            images = images[
+                :remaining
+            ]
+
+            tokens = tokens[
+                :remaining
+            ]
+
+            image_mask = image_mask[
+                :remaining
+            ]
 
         images = images.to(
             device,
@@ -274,47 +350,182 @@ def evaluate(
             non_blocking=True,
         )
 
-        # ----------------------------------------------------
-        # Teacher forcing
-        # ----------------------------------------------------
+        image_mask = image_mask.to(
+            device,
+            non_blocking=True,
+        )
 
-        decoder_input = tokens[:, :-1]
-        targets = tokens[:, 1:]
+        predictions = model.generate(
+            images,
+            bos_id=vocab.bos_id,
+            eos_id=vocab.eos_id,
+            max_len=GEN_MAX_LEN,
+            image_mask=image_mask,
+        )
+
+        for i in range(
+            images.shape[0]
+        ):
+            pred = strip_sequence(
+                predictions[i].tolist(),
+                vocab.bos_id,
+                vocab.eos_id,
+                vocab.pad_id,
+            )
+
+            target = strip_sequence(
+                tokens[i].tolist(),
+                vocab.bos_id,
+                vocab.eos_id,
+                vocab.pad_id,
+            )
+
+            if pred == target:
+                exact += 1
+
+            distance = edit_distance(
+                pred,
+                target,
+            )
+
+            total_distance += distance
+
+            total_ref_length += max(
+                len(target),
+                1,
+            )
+
+            if distance <= 1:
+                le1 += 1
+
+            if distance <= 2:
+                le2 += 1
+
+            total += 1
+
+    if total == 0:
+        return {
+            "gen_seq_acc": 0.0,
+            "ned": 1.0,
+            "le1": 0.0,
+            "le2": 0.0,
+        }
+
+    return {
+        "gen_seq_acc": exact / total,
+        "ned": (
+            total_distance
+            / max(total_ref_length, 1)
+        ),
+        "le1": le1 / total,
+        "le2": le2 / total,
+    }
+
+
+# =========================================================
+# Validation
+# =========================================================
+
+@torch.no_grad()
+def evaluate(
+    model,
+    loader,
+    device,
+    vocab,
+    gen_samples=500,
+):
+    model.eval()
+
+    total_loss = 0.0
+
+    total_batches = 0
+
+    total_correct = 0
+
+    total_tokens = 0
+
+    total_seq_correct = 0
+
+    total_sequences = 0
+
+    generation_done = 0
+
+    gen_exact = 0
+
+    gen_distance = 0
+
+    gen_ref_length = 0
+
+    gen_le1 = 0
+
+    gen_le2 = 0
+
+    for (
+        images,
+        tokens,
+        image_mask,
+        token_mask,
+        formulas,
+    ) in loader:
+
+        images = images.to(
+            device,
+            non_blocking=True,
+        )
+
+        tokens = tokens.to(
+            device,
+            non_blocking=True,
+        )
+
+        image_mask = image_mask.to(
+            device,
+            non_blocking=True,
+        )
+
+        # =================================================
+        # Teacher forcing
+        # =================================================
+
+        decoder_input = tokens[
+            :,
+            :-1,
+        ]
+
+        targets = tokens[
+            :,
+            1:,
+        ]
 
         logits, _ = model(
             images,
             decoder_input,
+            image_mask=image_mask,
         )
-
-        # ----------------------------------------------------
-        # Loss
-        # ----------------------------------------------------
 
         loss = compute_loss(
             logits,
             targets,
-            pad_id,
+            vocab.pad_id,
         )
 
-        # ----------------------------------------------------
-        # Prediction
-        # ----------------------------------------------------
+        total_loss += loss.item()
+
+        total_batches += 1
 
         predictions = logits.argmax(
             dim=-1
         )
 
-        mask = targets != pad_id
-
-        # ----------------------------------------------------
-        # Token accuracy
-        # ----------------------------------------------------
+        mask = (
+            targets != vocab.pad_id
+        )
 
         correct = (
             predictions == targets
         ) & mask
 
-        correct_tokens += (
+        total_correct += (
             correct.sum().item()
         )
 
@@ -322,253 +533,166 @@ def evaluate(
             mask.sum().item()
         )
 
-        # ----------------------------------------------------
-        # Teacher-forced sequence accuracy
-        #
-        # 一个序列所有有效 token 都正确，
-        # 才算整个 expression 正确。
-        # ----------------------------------------------------
-
-        sequence_correct = (
+        seq_correct = (
             (predictions == targets)
-            | ~mask
-        ).all(dim=1)
+            | (~mask)
+        ).all(
+            dim=1
+        )
 
-        correct_sequences += (
-            sequence_correct.sum().item()
+        total_seq_correct += (
+            seq_correct.sum().item()
         )
 
         total_sequences += (
-            tokens.size(0)
+            targets.shape[0]
         )
 
-        # ----------------------------------------------------
-        # Loss statistics
-        # ----------------------------------------------------
+        # =================================================
+        # Autoregressive generation
+        #
+        # 与 TF 共用相同的 validation batch，
+        # 避免之前 first 500 / full val 的不公平比较。
+        # =================================================
 
-        batch_size = images.size(0)
+        if generation_done < gen_samples:
 
-        total_loss += (
-            loss.item()
-            * batch_size
-        )
+            remaining = (
+                gen_samples
+                - generation_done
+            )
 
-        total_samples += batch_size
+            take = min(
+                remaining,
+                images.shape[0],
+            )
 
-    # ========================================================
-    # Final metrics
-    # ========================================================
+            gen_images = images[
+                :take
+            ]
 
-    avg_loss = (
-        total_loss /
-        max(total_samples, 1)
+            gen_tokens = tokens[
+                :take
+            ]
+
+            gen_masks = image_mask[
+                :take
+            ]
+
+            generated = model.generate(
+                gen_images,
+                bos_id=vocab.bos_id,
+                eos_id=vocab.eos_id,
+                max_len=GEN_MAX_LEN,
+                image_mask=gen_masks,
+            )
+
+            for i in range(take):
+
+                pred = strip_sequence(
+                    generated[i].tolist(),
+                    vocab.bos_id,
+                    vocab.eos_id,
+                    vocab.pad_id,
+                )
+
+                target = strip_sequence(
+                    gen_tokens[i].tolist(),
+                    vocab.bos_id,
+                    vocab.eos_id,
+                    vocab.pad_id,
+                )
+
+                if pred == target:
+                    gen_exact += 1
+
+                distance = edit_distance(
+                    pred,
+                    target,
+                )
+
+                gen_distance += (
+                    distance
+                )
+
+                gen_ref_length += max(
+                    len(target),
+                    1,
+                )
+
+                if distance <= 1:
+                    gen_le1 += 1
+
+                if distance <= 2:
+                    gen_le2 += 1
+
+            generation_done += take
+
+    token_acc = (
+        total_correct
+        / max(total_tokens, 1)
     )
 
-    token_accuracy = (
-        correct_tokens /
-        max(total_tokens, 1)
-        * 100.0
+    tf_seq_acc = (
+        total_seq_correct
+        / max(total_sequences, 1)
     )
 
-    tf_sequence_accuracy = (
-        correct_sequences /
-        max(total_sequences, 1)
-        * 100.0
+    gen_seq_acc = (
+        gen_exact
+        / max(generation_done, 1)
     )
 
-    return (
-        avg_loss,
-        token_accuracy,
-        tf_sequence_accuracy,
+    gen_ned = (
+        gen_distance
+        / max(gen_ref_length, 1)
     )
 
-
-# ============================================================
-# Fast autoregressive generation
-#
-# 注意：
-#
-# 这里仍然是 autoregressive。
-#
-# 但是 Encoder 只运行一次：
-#
-# image
-#   ↓
-# encoder
-#   ↓
-# memory
-#
-# 然后 decoder 才逐 token 生成。
-# ============================================================
-
-@torch.no_grad()
-def generate_batch(
-    model,
-    images,
-    bos_id,
-    eos_id,
-    max_len,
-):
-    model.eval()
-
-    batch_size = images.size(0)
-
-    # --------------------------------------------------------
-    # Encoder 只运行一次
-    # --------------------------------------------------------
-
-    memory, grid_h, grid_w = model.encode(
-        images
-    )
-
-    # --------------------------------------------------------
-    # 初始 token
-    # --------------------------------------------------------
-
-    ids = torch.full(
-        (
-            batch_size,
-            1,
+    return {
+        "loss": (
+            total_loss
+            / max(total_batches, 1)
         ),
-        bos_id,
-        dtype=torch.long,
-        device=images.device,
-    )
-
-    # --------------------------------------------------------
-    # 每个样本是否已经结束
-    # --------------------------------------------------------
-
-    finished = torch.zeros(
-        batch_size,
-        dtype=torch.bool,
-        device=images.device,
-    )
-
-    # ========================================================
-    # Autoregressive decoding
-    # ========================================================
-
-    for _ in range(max_len - 1):
-
-        hidden, _, _ = model.decode_hidden(
-            ids,
-            memory,
-            grid_h,
-            grid_w,
-        )
-
-        logits = model.head(
-            hidden[:, -1]
-        )
-
-        next_token = logits.argmax(
-            dim=-1
-        )
-
-        # ----------------------------------------------------
-        # 已经结束的样本强制 EOS
-        # ----------------------------------------------------
-
-        next_token = torch.where(
-            finished,
-            torch.full_like(
-                next_token,
-                eos_id,
-            ),
-            next_token,
-        )
-
-        ids = torch.cat(
-            [
-                ids,
-                next_token.unsqueeze(1),
-            ],
-            dim=1,
-        )
-
-        # ----------------------------------------------------
-        # 更新 finished
-        # ----------------------------------------------------
-
-        finished |= (
-            next_token == eos_id
-        )
-
-        # ----------------------------------------------------
-        # 整个 batch 都结束
-        # ----------------------------------------------------
-
-        if finished.all():
-            break
-
-    return ids
+        "token_acc": token_acc,
+        "tf_seq_acc": tf_seq_acc,
+        "gen_seq_acc": gen_seq_acc,
+        "gen_ned": gen_ned,
+        "gen_le1": (
+            gen_le1
+            / max(generation_done, 1)
+        ),
+        "gen_le2": (
+            gen_le2
+            / max(generation_done, 1)
+        ),
+    }
 
 
-# ============================================================
-# Real autoregressive sequence accuracy
-#
-# 只计算 GEN_EVAL_SAMPLES 个样本。
-#
-# 这个指标才是真正的：
-#
-# image
-#   ↓
-# BOS
-#   ↓
-# token1
-#   ↓
-# token2
-#   ↓
-# ...
-#
-# 而不是 teacher forcing。
-# ============================================================
+# =========================================================
+# Training
+# =========================================================
 
-@torch.no_grad()
-def evaluate_generation_sequence_accuracy(
+def train_one_epoch(
     model,
     loader,
-    vocab,
+    optimizer,
+    scaler,
     device,
-    max_samples,
+    pad_id,
 ):
-    model.eval()
+    model.train()
 
-    correct_sequences = 0
-    total_sequences = 0
+    total_loss = 0.0
 
-    processed_samples = 0
+    total_batches = 0
 
-    progress = tqdm(
-        loader,
-        desc=(
-            "Autoregressive validation"
-        ),
-        leave=False,
-    )
-
-    for images, tokens, _, _ in progress:
-
-        # ----------------------------------------------------
-        # 达到样本数量后停止
-        # ----------------------------------------------------
-
-        if processed_samples >= max_samples:
-            break
-
-        remaining = (
-            max_samples -
-            processed_samples
-        )
-
-        # ----------------------------------------------------
-        # 最后一批只取需要的数量
-        # ----------------------------------------------------
-
-        if images.size(0) > remaining:
-            images = images[:remaining]
-            tokens = tokens[:remaining]
+    for (
+        images,
+        tokens,
+        image_mask,
+        token_mask,
+        formulas,
+    ) in loader:
 
         images = images.to(
             device,
@@ -580,119 +704,97 @@ def evaluate_generation_sequence_accuracy(
             non_blocking=True,
         )
 
-        # ----------------------------------------------------
-        # Real autoregressive generation
-        # ----------------------------------------------------
-
-        generated = generate_batch(
-            model=model,
-            images=images,
-            bos_id=vocab.bos_id,
-            eos_id=vocab.eos_id,
-            max_len=GEN_MAX_LEN,
+        image_mask = image_mask.to(
+            device,
+            non_blocking=True,
         )
 
-        # ----------------------------------------------------
-        # Remove BOS
-        # ----------------------------------------------------
+        decoder_input = tokens[
+            :,
+            :-1,
+        ]
 
-        generated = generated[:, 1:]
+        targets = tokens[
+            :,
+            1:,
+        ]
 
-        targets = tokens[:, 1:]
+        optimizer.zero_grad(
+            set_to_none=True
+        )
 
-        batch_size = tokens.size(0)
+        if scaler is not None:
 
-        # ====================================================
-        # Compare every expression
-        # ====================================================
-
-        for i in range(batch_size):
-
-            pred = generated[i]
-            target = targets[i]
-
-            # ------------------------------------------------
-            # Target EOS
-            # ------------------------------------------------
-
-            eos_positions = (
-                target == vocab.eos_id
-            ).nonzero(
-                as_tuple=False
-            )
-
-            if eos_positions.numel() > 0:
-
-                target_end = (
-                    eos_positions[0].item()
-                    + 1
-                )
-
-            else:
-
-                valid_positions = (
-                    target != vocab.pad_id
-                ).nonzero(
-                    as_tuple=False
-                )
-
-                if valid_positions.numel() == 0:
-                    target_end = 0
-                else:
-                    target_end = (
-                        valid_positions[-1].item()
-                        + 1
-                    )
-
-            target = target[:target_end]
-
-            # ------------------------------------------------
-            # Prediction EOS
-            # ------------------------------------------------
-
-            pred_eos_positions = (
-                pred == vocab.eos_id
-            ).nonzero(
-                as_tuple=False
-            )
-
-            if pred_eos_positions.numel() > 0:
-
-                pred_end = (
-                    pred_eos_positions[0].item()
-                    + 1
-                )
-
-                pred = pred[:pred_end]
-
-            # ------------------------------------------------
-            # Exact sequence match
-            # ------------------------------------------------
-
-            if torch.equal(
-                pred,
-                target,
+            with torch.cuda.amp.autocast(
+                enabled=True
             ):
-                correct_sequences += 1
+                logits, _ = model(
+                    images,
+                    decoder_input,
+                    image_mask=image_mask,
+                )
 
-            total_sequences += 1
+                loss = compute_loss(
+                    logits,
+                    targets,
+                    pad_id,
+                )
 
-        processed_samples += batch_size
+            scaler.scale(
+                loss
+            ).backward()
 
-        progress.set_postfix(
-            samples=processed_samples
-        )
+            scaler.unscale_(
+                optimizer
+            )
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                GRAD_CLIP,
+            )
+
+            scaler.step(
+                optimizer
+            )
+
+            scaler.update()
+
+        else:
+
+            logits, _ = model(
+                images,
+                decoder_input,
+                image_mask=image_mask,
+            )
+
+            loss = compute_loss(
+                logits,
+                targets,
+                pad_id,
+            )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                GRAD_CLIP,
+            )
+
+            optimizer.step()
+
+        total_loss += loss.item()
+
+        total_batches += 1
 
     return (
-        correct_sequences /
-        max(total_sequences, 1)
-        * 100.0
+        total_loss
+        / max(total_batches, 1)
     )
 
 
-# ============================================================
-# Checkpoint
-# ============================================================
+# =========================================================
+# Save
+# =========================================================
 
 def save_checkpoint(
     path,
@@ -700,193 +802,261 @@ def save_checkpoint(
     optimizer,
     scheduler,
     epoch,
-    best_val,
+    vocab,
+    best_loss,
     best_acc,
 ):
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": epoch,
-            "best_val": best_val,
-            "best_acc": best_acc,
-            "config": {
-                "max_len": MAX_LEN,
-                "model_dim": MODEL_DIM,
-                "heads": NUM_HEADS,
-                "decoder_depth": DECODER_DEPTH,
-            },
+    checkpoint = {
+        "epoch": epoch,
+
+        "model": model.state_dict(),
+
+        "optimizer": optimizer.state_dict(),
+
+        "scheduler": (
+            scheduler.state_dict()
+            if scheduler is not None
+            else None
+        ),
+
+        "vocab_stoi": vocab.stoi,
+
+        "best_loss": best_loss,
+
+        "best_acc": best_acc,
+
+        "config": {
+            "model_dim": MODEL_DIM,
+            "num_heads": NUM_HEADS,
+            "decoder_depth": DECODER_DEPTH,
+            "ff_dim": FF_DIM,
+            "max_len": MAX_LEN,
+            "image_height": IMAGE_HEIGHT,
+            "max_image_width": MAX_IMAGE_WIDTH,
         },
+    }
+
+    torch.save(
+        checkpoint,
         path,
     )
 
 
-# ============================================================
+# =========================================================
 # Main
-# ============================================================
+# =========================================================
 
 def main():
-
-    # ========================================================
-    # Seed
-    # ========================================================
-
-    set_seed(SEED)
-
-    # ========================================================
-    # Directories
-    # ========================================================
+    seed_everything(
+        SEED
+    )
 
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    DATA_CACHE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # ========================================================
-    # Device
-    # ========================================================
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = get_device()
 
     print(
         f"Device: {device}"
     )
 
+    # =====================================================
+    # Dataset download
+    # =====================================================
+
     print(
-        f"Dataset: {DATASET_NAME}"
+        "Loading Im2LaTeX-100K..."
+    )
+
+    dataset = (
+        download_im2latex100k()
     )
 
     print(
-        f"Cache: {DATA_CACHE_DIR.resolve()}"
+        dataset
     )
 
-    # ========================================================
-    # Dataset
-    # ========================================================
+    # =====================================================
+    # Vocabulary
+    # =====================================================
 
-    dataset = download_im2latex100k()
+    print(
+        "Building vocabulary..."
+    )
 
-    train_split = dataset["train"]
-
-    val_split = choose_validation_split(
+    vocab = build_vocab(
         dataset
     )
 
     print(
-        f"Train samples: "
-        f"{len(train_split):,}"
+        f"Vocabulary size: {len(vocab)}"
     )
 
     print(
-        f"Validation samples: "
-        f"{len(val_split):,}"
-    )
-
-    # ========================================================
-    # Vocabulary
-    # ========================================================
-
-    vocab = build_or_load_vocab(
-        train_split
+        f"PAD: {vocab.pad_id}"
     )
 
     print(
-        f"Vocabulary size: "
-        f"{len(vocab):,}"
+        f"BOS: {vocab.bos_id}"
     )
 
-    # ========================================================
-    # DataLoader
-    # ========================================================
+    print(
+        f"EOS: {vocab.eos_id}"
+    )
 
-    train_loader = make_loader(
-        train_split,
+    print(
+        f"UNK: {vocab.unk_id}"
+    )
+
+    # =====================================================
+    # Dataset
+    # =====================================================
+
+    train_dataset = Im2LatexHF(
+        dataset["train"],
         vocab,
-        shuffle=True,
+        max_len=MAX_LEN,
+        image_height=IMAGE_HEIGHT,
+        max_width=MAX_IMAGE_WIDTH,
     )
 
-    val_loader = make_loader(
+    if "validation" in dataset:
+        val_split = dataset[
+            "validation"
+        ]
+    else:
+        val_split = dataset[
+            "val"
+        ]
+
+    val_dataset = Im2LatexHF(
         val_split,
         vocab,
+        max_len=MAX_LEN,
+        image_height=IMAGE_HEIGHT,
+        max_width=MAX_IMAGE_WIDTH,
+    )
+
+    # =====================================================
+    # DataLoader
+    # =====================================================
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
+        collate_fn=lambda batch:
+            collate_fn(
+                batch,
+                vocab.pad_id,
+            ),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
         shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
+        collate_fn=lambda batch:
+            collate_fn(
+                batch,
+                vocab.pad_id,
+            ),
     )
 
-    # ========================================================
+    print(
+        f"Train samples: {len(train_dataset)}"
+    )
+
+    print(
+        f"Val samples: {len(val_dataset)}"
+    )
+
+    # =====================================================
     # Model
-    # ========================================================
-
-    entity_ids = make_entity_ids(
-        vocab
-    )
+    # =====================================================
 
     model = SpatialHMER(
         vocab_size=len(vocab),
-        dim=MODEL_DIM,
-        heads=NUM_HEADS,
-        decoder_depth=DECODER_DEPTH,
-        max_len=MAX_LEN,
         pad_id=vocab.pad_id,
-        entity_ids=entity_ids,
-    ).to(device)
-
-    print(
-        f"Model parameters: "
-        f"{sum(p.numel() for p in model.parameters()):,}"
+        model_dim=MODEL_DIM,
+        num_heads=NUM_HEADS,
+        decoder_depth=DECODER_DEPTH,
+        ff_dim=FF_DIM,
+        max_len=MAX_LEN,
+        dropout=DROPOUT,
     )
 
-    # ========================================================
+    model = model.to(
+        device
+    )
+
+    parameter_count = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    print(
+        f"Parameters: {parameter_count:,}"
+    )
+
+    # =====================================================
     # Optimizer
-    # ========================================================
+    # =====================================================
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
+        betas=(
+            0.9,
+            0.98,
+        ),
     )
 
-    # ========================================================
-    # Scheduler
-    # ========================================================
-
-    scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=EPOCHS,
-        )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS,
+        eta_min=1e-6,
     )
 
-    # ========================================================
+    # =====================================================
+    # AMP
+    # =====================================================
+
+    scaler = (
+        torch.cuda.amp.GradScaler()
+        if device.type == "cuda"
+        else None
+    )
+
+    # =====================================================
     # Resume
-    # ========================================================
+    # =====================================================
 
-    start_epoch = 0
+    start_epoch = 1
 
-    best_val = float("inf")
+    best_loss = float(
+        "inf"
+    )
+
     best_acc = 0.0
 
-    if RESUME_CHECKPOINT:
-
-        checkpoint_path = Path(
-            RESUME_CHECKPOINT
-        )
-
-        print(
-            f"Resuming from: "
-            f"{checkpoint_path}"
-        )
+    if RESUME_CHECKPOINT is not None:
 
         checkpoint = torch.load(
-            checkpoint_path,
+            RESUME_CHECKPOINT,
             map_location=device,
         )
 
@@ -894,216 +1064,76 @@ def main():
             checkpoint["model"]
         )
 
-        optimizer.load_state_dict(
-            checkpoint["optimizer"]
-        )
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(
+                checkpoint["optimizer"]
+            )
 
-        if "scheduler" in checkpoint:
-
+        if (
+            scheduler is not None
+            and checkpoint.get(
+                "scheduler"
+            ) is not None
+        ):
             scheduler.load_state_dict(
                 checkpoint["scheduler"]
             )
 
-        start_epoch = checkpoint.get(
-            "epoch",
-            0,
+        start_epoch = (
+            checkpoint["epoch"] + 1
         )
 
-        best_val = checkpoint.get(
-            "best_val",
-            best_val,
+        best_loss = checkpoint.get(
+            "best_loss",
+            float("inf"),
         )
 
         best_acc = checkpoint.get(
             "best_acc",
-            best_acc,
+            0.0,
         )
 
-    # ========================================================
-    # Training
-    # ========================================================
+        print(
+            f"Resumed from epoch "
+            f"{start_epoch}"
+        )
+
+    # =====================================================
+    # Training loop
+    # =====================================================
 
     for epoch in range(
         start_epoch,
-        EPOCHS,
+        EPOCHS + 1,
     ):
 
-        model.train()
-
-        running_loss = 0.0
-        sample_count = 0
-
-        # ====================================================
-        # Train progress
-        # ====================================================
-
-        progress = tqdm(
+        train_loss = train_one_epoch(
+            model,
             train_loader,
-            desc=(
-                f"Epoch "
-                f"{epoch + 1}/{EPOCHS}"
-            ),
+            optimizer,
+            scaler,
+            device,
+            vocab.pad_id,
         )
 
-        # ====================================================
-        # Training loop
-        # ====================================================
-
-        for images, tokens, _, _ in progress:
-
-            images = images.to(
-                device,
-                non_blocking=True,
-            )
-
-            tokens = tokens.to(
-                device,
-                non_blocking=True,
-            )
-
-            # ------------------------------------------------
-            # Clear gradients
-            # ------------------------------------------------
-
-            optimizer.zero_grad(
-                set_to_none=True
-            )
-
-            # ------------------------------------------------
-            # Teacher forcing
-            # ------------------------------------------------
-
-            decoder_input = tokens[:, :-1]
-
-            targets = tokens[:, 1:]
-
-            # ------------------------------------------------
-            # Forward
-            # ------------------------------------------------
-
-            logits, _ = model(
-                images,
-                decoder_input,
-            )
-
-            # ------------------------------------------------
-            # Loss
-            # ------------------------------------------------
-
-            loss = compute_loss(
-                logits,
-                targets,
-                vocab.pad_id,
-            )
-
-            # ------------------------------------------------
-            # Backward
-            # ------------------------------------------------
-
-            loss.backward()
-
-            # ------------------------------------------------
-            # Gradient clipping
-            # ------------------------------------------------
-
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                GRAD_CLIP,
-            )
-
-            # ------------------------------------------------
-            # Optimizer
-            # ------------------------------------------------
-
-            optimizer.step()
-
-            # ------------------------------------------------
-            # Statistics
-            # ------------------------------------------------
-
-            batch_size = images.size(0)
-
-            running_loss += (
-                loss.item()
-                * batch_size
-            )
-
-            sample_count += batch_size
-
-            progress.set_postfix(
-                loss=f"{loss.item():.4f}"
-            )
-
-        # ====================================================
-        # Scheduler
-        # ====================================================
+        metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            vocab,
+            gen_samples=GEN_EVAL_SAMPLES,
+        )
 
         scheduler.step()
 
-        train_loss = (
-            running_loss /
-            max(sample_count, 1)
-        )
-
-        # ====================================================
-        # Validation 1
-        #
-        # 一次 forward 获得：
-        #
-        #   val_loss
-        #   token_acc
-        #   tf_seq_acc
-        #
-        # 不再重复验证。
-        # ====================================================
-
-        (
-            val_loss,
-            token_acc,
-            tf_seq_acc,
-        ) = evaluate(
-            model,
-            val_loader,
-            vocab.pad_id,
-            device,
-        )
-
-        # ====================================================
-        # Validation 2
-        #
-        # Real autoregressive generation
-        #
-        # 只测试固定数量样本。
-        # ====================================================
-
-        gen_seq_acc = (
-            evaluate_generation_sequence_accuracy(
-                model=model,
-                loader=val_loader,
-                vocab=vocab,
-                device=device,
-                max_samples=GEN_EVAL_SAMPLES,
-            )
-        )
-
-        # ====================================================
-        # Learning rate
-        # ====================================================
-
-        lr = scheduler.get_last_lr()[0]
-
-        # ====================================================
-        # Print metrics
-        # ====================================================
+        lr = optimizer.param_groups[
+            0
+        ]["lr"]
 
         print()
 
         print(
-            "=" * 80
-        )
-
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS}"
+            f"Epoch {epoch}/{EPOCHS}"
         )
 
         print(
@@ -1111,116 +1141,111 @@ def main():
         )
 
         print(
-            f"val_loss   : {val_loss:.5f}"
+            f"val_loss   : {metrics['loss']:.5f}"
         )
 
         print(
-            f"token_acc  : {token_acc:.2f}%"
+            f"token_acc  : "
+            f"{metrics['token_acc'] * 100:.2f}%"
         )
 
         print(
-            f"tf_seq_acc : {tf_seq_acc:.2f}%"
+            f"tf_seq_acc : "
+            f"{metrics['tf_seq_acc'] * 100:.2f}%"
         )
 
         print(
-            f"gen_seq_acc: {gen_seq_acc:.2f}% "
-            f"(first {GEN_EVAL_SAMPLES} samples)"
+            f"gen_seq_acc: "
+            f"{metrics['gen_seq_acc'] * 100:.2f}%"
+        )
+
+        print(
+            f"gen_NED    : "
+            f"{metrics['gen_ned']:.4f}"
+        )
+
+        print(
+            f"gen_<=1    : "
+            f"{metrics['gen_le1'] * 100:.2f}%"
+        )
+
+        print(
+            f"gen_<=2    : "
+            f"{metrics['gen_le2'] * 100:.2f}%"
         )
 
         print(
             f"lr         : {lr:.3e}"
         )
 
-        print(
-            "=" * 80
-        )
-
-        print()
-
-        # ====================================================
-        # Save last checkpoint
-        # ====================================================
+        # =================================================
+        # last
+        # =================================================
 
         save_checkpoint(
             OUTPUT_DIR / "last.pt",
             model,
             optimizer,
             scheduler,
-            epoch + 1,
-            best_val,
+            epoch,
+            vocab,
+            best_loss,
             best_acc,
         )
 
-        # ====================================================
-        # Best validation loss
-        # ====================================================
+        # =================================================
+        # best loss
+        # =================================================
 
-        if val_loss < best_val:
+        if metrics["loss"] < best_loss:
 
-            best_val = val_loss
+            best_loss = metrics["loss"]
 
             save_checkpoint(
-                OUTPUT_DIR / "best_loss.pt",
+                OUTPUT_DIR
+                / "best_loss.pt",
                 model,
                 optimizer,
                 scheduler,
-                epoch + 1,
-                best_val,
+                epoch,
+                vocab,
+                best_loss,
                 best_acc,
             )
 
             print(
-                "Saved best loss checkpoint: "
-                f"{OUTPUT_DIR / 'best_loss.pt'}"
+                "Saved best_loss.pt"
             )
 
-        # ====================================================
-        # Best autoregressive accuracy
-        # ====================================================
+        # =================================================
+        # best generation accuracy
+        # =================================================
 
-        if gen_seq_acc > best_acc:
+        if (
+            metrics["gen_seq_acc"]
+            > best_acc
+        ):
 
-            best_acc = gen_seq_acc
+            best_acc = (
+                metrics["gen_seq_acc"]
+            )
 
             save_checkpoint(
-                OUTPUT_DIR / "best_acc.pt",
+                OUTPUT_DIR
+                / "best_acc.pt",
                 model,
                 optimizer,
                 scheduler,
-                epoch + 1,
-                best_val,
+                epoch,
+                vocab,
+                best_loss,
                 best_acc,
             )
 
             print(
-                "Saved best generation accuracy checkpoint: "
-                f"{OUTPUT_DIR / 'best_acc.pt'}"
+                "Saved best_acc.pt"
             )
 
-    # ========================================================
-    # Finished
-    # ========================================================
-
-    print()
-
-    print(
-        "Training finished."
-    )
-
-    print(
-        f"Best loss checkpoint: "
-        f"{OUTPUT_DIR / 'best_loss.pt'}"
-    )
-
-    print(
-        f"Best generation accuracy checkpoint: "
-        f"{OUTPUT_DIR / 'best_acc.pt'}"
-    )
-
-
-# ============================================================
-# Entry
-# ============================================================
 
 if __name__ == "__main__":
     main()

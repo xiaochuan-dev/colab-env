@@ -3,24 +3,56 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from x_transformers import ContinuousTransformerWrapper, Decoder
+
+from x_transformers import (
+    ContinuousTransformerWrapper,
+    Decoder,
+)
 
 
 class ConvBackbone(nn.Module):
-    def __init__(self, dim=256):
+    def __init__(self):
         super().__init__()
+
         self.net = nn.Sequential(
-            nn.Conv2d(1, 64, 3, 2, 1),
+            nn.Conv2d(
+                1,
+                64,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(64, 128, 3, 2, 1),
+
+            nn.Conv2d(
+                64,
+                128,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
             nn.BatchNorm2d(128),
             nn.GELU(),
-            nn.Conv2d(128, 192, 3, 2, 1),
+
+            nn.Conv2d(
+                128,
+                192,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
             nn.BatchNorm2d(192),
             nn.GELU(),
-            nn.Conv2d(192, dim, 3, 2, 1),
-            nn.BatchNorm2d(dim),
+
+            nn.Conv2d(
+                192,
+                256,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
+            nn.BatchNorm2d(256),
             nn.GELU(),
         )
 
@@ -28,311 +60,1118 @@ class ConvBackbone(nn.Module):
         return self.net(x)
 
 
-class GeometrySelfAttention(nn.Module):
-    def __init__(self, dim=256, heads=8, geo_dim=64, dropout=0.1):
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim,
+        hidden_dim,
+        dropout=0.1,
+    ):
         super().__init__()
-        assert dim % heads == 0
-        self.dim = dim
-        self.heads = heads
-        self.dk = dim // heads
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.drop = nn.Dropout(dropout)
-        self.geo = nn.Sequential(
-            nn.Linear(2, geo_dim),
-            nn.ReLU(),
-            nn.Linear(geo_dim, heads),
-        )
-        self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x, h, w, mask=None):
-        b, n, d = x.shape
-        y = self.norm(x)
-
-        q, k, v = self.qkv(y).chunk(3, dim=-1)
-        q = q.view(b, n, self.heads, self.dk).transpose(1, 2)
-        k = k.view(b, n, self.heads, self.dk).transpose(1, 2)
-        v = v.view(b, n, self.heads, self.dk).transpose(1, 2)
-
-        yy, xx = torch.meshgrid(
-            torch.linspace(0, 1, h, device=x.device),
-            torch.linspace(0, 1, w, device=x.device),
-            indexing="ij",
-        )
-        coords = torch.stack([xx.flatten(), yy.flatten()], dim=-1)
-        rel = coords[:, None, :] - coords[None, :, :]
-        rel = torch.sign(rel) * torch.log1p(rel.abs() * max(h, w))
-        geometry_bias = self.geo(rel).permute(2, 0, 1).unsqueeze(0)
-
-        energy = q @ k.transpose(-2, -1) / math.sqrt(self.dk)
-        energy = energy + geometry_bias
-
-        if mask is not None:
-            energy = energy.masked_fill(
-                ~mask[:, None, None, :], -torch.finfo(energy.dtype).max
-            )
-
-        attention = energy.softmax(dim=-1)
-        z = (attention @ v).transpose(1, 2).reshape(b, n, d)
-        return x + self.drop(self.proj(z))
-
-
-class FFN(nn.Module):
-    def __init__(self, dim=256, mult=4, dropout=0.1):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
         self.net = nn.Sequential(
-            nn.Linear(dim, dim * mult),
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim * mult, dim),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
-        return x + self.net(self.norm(x))
+        return self.net(x)
 
 
-class GeometryEncoder(nn.Module):
-    def __init__(self, dim=256, depth=3, heads=8):
+class GeometrySelfAttention(nn.Module):
+    """
+    Geometry-aware self attention。
+
+    使用二维 feature-grid 坐标作为 relative geometry bias。
+    """
+
+    def __init__(
+        self,
+        dim=256,
+        heads=8,
+        dropout=0.1,
+    ):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                nn.ModuleList(
-                    [GeometrySelfAttention(dim, heads), FFN(dim)]
-                )
-                for _ in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(dim)
 
-    def forward(self, feat):
-        _, _, h, w = feat.shape
-        x = feat.flatten(2).transpose(1, 2)
-        for attention, ffn in self.layers:
-            x = attention(x, h, w)
-            x = ffn(x)
-        return self.norm(x), h, w
-
-
-class GaussianCrossAttention(nn.Module):
-    """First decoder cross-attention with an explicit Gaussian spatial prior."""
-
-    def __init__(self, dim=256, heads=8, gaussian_hidden=128, dropout=0.1):
-        super().__init__()
-        assert dim % heads == 0
         self.dim = dim
         self.heads = heads
-        self.dk = dim // heads
+        self.head_dim = dim // heads
 
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
+        assert dim % heads == 0
 
-        self.gaussian = nn.Sequential(
-            nn.Linear(dim, gaussian_hidden),
-            nn.GELU(),
-            nn.Linear(gaussian_hidden, 4),
+        self.qkv = nn.Linear(
+            dim,
+            dim * 3,
         )
-        self.norm = nn.LayerNorm(dim)
-        self.drop = nn.Dropout(dropout)
+
+        self.out = nn.Linear(
+            dim,
+            dim,
+        )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+        self.geometry = nn.Sequential(
+            nn.Linear(4, 64),
+            nn.GELU(),
+            nn.Linear(64, heads),
+        )
 
     def forward(
         self,
         x,
-        context,
-        grid_h,
-        grid_w,
-        context_mask=None,
-        entity_mask=None,
+        coords,
+        mask=None,
     ):
-        b, t, d = x.shape
-        n = context.shape[1]
-        if n != grid_h * grid_w:
-            raise ValueError(
-                f"Context length {n} != grid_h*grid_w ({grid_h}*{grid_w})"
-            )
+        """
+        x:
+            [B, N, D]
 
-        z = self.norm(x)
-        q = self.q(z).view(b, t, self.heads, self.dk).transpose(1, 2)
-        k = self.k(context).view(b, n, self.heads, self.dk).transpose(1, 2)
-        v = self.v(context).view(b, n, self.heads, self.dk).transpose(1, 2)
+        coords:
+            [N, 2]
 
-        energy = q @ k.transpose(-2, -1) / math.sqrt(self.dk)
+        mask:
+            [B, N]
+            True = valid
+        """
 
-        params = self.gaussian(z)
-        mu = torch.sigmoid(params[..., :2])
-        sigma = F.softplus(params[..., 2:]) + 1e-3
+        b, n, d = x.shape
 
-        ys = torch.linspace(0, 1, grid_h, device=x.device)
-        xs = torch.linspace(0, 1, grid_w, device=x.device)
-        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-        coords = torch.stack([gx.flatten(), gy.flatten()], dim=-1)
+        qkv = self.qkv(x)
 
-        dx = coords[None, None, :, 0] - mu[:, :, None, 0]
-        dy = coords[None, None, :, 1] - mu[:, :, None, 1]
-        gaussian = torch.exp(
-            -0.5
-            * (
-                (dx / sigma[:, :, None, 0]) ** 2
-                + (dy / sigma[:, :, None, 1]) ** 2
-            )
+        qkv = qkv.reshape(
+            b,
+            n,
+            3,
+            self.heads,
+            self.head_dim,
         )
-        gaussian = gaussian / (gaussian.sum(-1, keepdim=True) + 1e-6)
 
-        if entity_mask is None:
-            entity_mask = torch.ones(
-                b, t, device=x.device, dtype=torch.bool
+        qkv = qkv.permute(
+            2,
+            0,
+            3,
+            1,
+            4,
+        )
+
+        q, k, v = qkv
+
+        scores = torch.matmul(
+            q,
+            k.transpose(-2, -1),
+        )
+
+        scores = scores / math.sqrt(
+            self.head_dim
+        )
+
+        delta = (
+            coords[:, None, :]
+            - coords[None, :, :]
+        )
+
+        abs_delta = delta.abs()
+
+        geo_input = torch.cat(
+            [
+                delta,
+                abs_delta,
+            ],
+            dim=-1,
+        )
+
+        geometry_bias = self.geometry(
+            geo_input
+        )
+
+        geometry_bias = geometry_bias.permute(
+            2,
+            0,
+            1,
+        )
+
+        scores = (
+            scores
+            + geometry_bias.unsqueeze(0)
+        )
+
+        if mask is not None:
+            key_mask = ~mask
+
+            scores = scores.masked_fill(
+                key_mask[:, None, None, :],
+                -torch.finfo(scores.dtype).max,
             )
 
-        spatial_bias = torch.log(gaussian.clamp_min(1e-6)).unsqueeze(1)
-        energy = energy + spatial_bias * entity_mask[:, None, :, None].float()
+        attn = F.softmax(
+            scores,
+            dim=-1,
+        )
 
-        if context_mask is not None:
-            energy = energy.masked_fill(
-                ~context_mask[:, None, None, :], -torch.finfo(energy.dtype).max
-            )
+        attn = self.dropout(attn)
 
-        attention = energy.softmax(dim=-1)
-        out = (attention @ v).transpose(1, 2).reshape(b, t, d)
-        return x + self.drop(self.o(out)), attention, mu
+        out = torch.matmul(
+            attn,
+            v,
+        )
+
+        out = out.transpose(
+            1,
+            2,
+        ).reshape(
+            b,
+            n,
+            d,
+        )
+
+        out = self.out(out)
+
+        return out
 
 
-class SelfBlock(nn.Module):
-    def __init__(self, dim=256, heads=8, dropout=0.1):
+class GeometryEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        dim=256,
+        heads=8,
+        ff_dim=1024,
+        dropout=0.1,
+    ):
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            dim, heads, dropout=dropout, batch_first=True
+
+        self.norm1 = nn.LayerNorm(dim)
+
+        self.attn = GeometrySelfAttention(
+            dim=dim,
+            heads=heads,
+            dropout=dropout,
         )
-        self.n1 = nn.LayerNorm(dim)
-        self.ff_norm = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * 4),
+
+        self.norm2 = nn.LayerNorm(dim)
+
+        self.ff = FeedForward(
+            dim,
+            ff_dim,
+            dropout,
+        )
+
+    def forward(
+        self,
+        x,
+        coords,
+        mask=None,
+    ):
+        x = x + self.attn(
+            self.norm1(x),
+            coords,
+            mask,
+        )
+
+        x = x + self.ff(
+            self.norm2(x)
+        )
+
+        if mask is not None:
+            x = x * mask.unsqueeze(-1)
+
+        return x
+
+
+class GeometryEncoder(nn.Module):
+    def __init__(
+        self,
+        dim=256,
+        depth=3,
+        heads=8,
+        ff_dim=1024,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.layers = nn.ModuleList(
+            [
+                GeometryEncoderLayer(
+                    dim=dim,
+                    heads=heads,
+                    ff_dim=ff_dim,
+                    dropout=dropout,
+                )
+                for _ in range(depth)
+            ]
+        )
+
+    def forward(
+        self,
+        x,
+        coords,
+        mask=None,
+    ):
+        for layer in self.layers:
+            x = layer(
+                x,
+                coords,
+                mask,
+            )
+
+        return x
+
+
+class GaussianPredictor(nn.Module):
+    """
+    LGP:
+        hidden state -> mu_x, mu_y, sigma_x, sigma_y
+    """
+
+    def __init__(
+        self,
+        dim=256,
+        hidden_dim=128,
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim),
+            nn.Linear(hidden_dim, 4),
         )
-        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        t = x.shape[1]
-        causal_mask = torch.triu(
-            torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1
+        params = self.net(x)
+
+        mu = torch.sigmoid(
+            params[..., :2]
         )
+
+        sigma = F.softplus(
+            params[..., 2:4]
+        ) + 1e-3
+
+        return mu, sigma
+
+
+class GaussianCrossAttention(nn.Module):
+    """
+    Cross attention + Gaussian spatial prior。
+
+    ARM coverage 也在这里加入。
+    """
+
+    def __init__(
+        self,
+        dim=256,
+        heads=8,
+        dropout=0.1,
+        use_arm=True,
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+
+        self.use_arm = use_arm
+
+        assert dim % heads == 0
+
+        self.q = nn.Linear(
+            dim,
+            dim,
+        )
+
+        self.k = nn.Linear(
+            dim,
+            dim,
+        )
+
+        self.v = nn.Linear(
+            dim,
+            dim,
+        )
+
+        self.out = nn.Linear(
+            dim,
+            dim,
+        )
+
+        self.lgp = GaussianPredictor(
+            dim=dim,
+            hidden_dim=128,
+        )
+
+        if use_arm:
+            self.arm = nn.Conv2d(
+                1,
+                32,
+                kernel_size=5,
+                padding=2,
+            )
+
+            self.arm_out = nn.Conv2d(
+                32,
+                1,
+                kernel_size=1,
+            )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+    def forward(
+        self,
+        x,
+        memory,
+        grid_h,
+        grid_w,
+        memory_mask=None,
+        coverage=None,
+    ):
+        """
+        x:
+            [B, T, D]
+
+        memory:
+            [B, N, D]
+        """
+
+        b, t, d = x.shape
+
+        n = memory.shape[1]
+
+        q = self.q(x)
+        k = self.k(memory)
+        v = self.v(memory)
+
+        q = q.reshape(
+            b,
+            t,
+            self.heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        k = k.reshape(
+            b,
+            n,
+            self.heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        v = v.reshape(
+            b,
+            n,
+            self.heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        scores = torch.matmul(
+            q,
+            k.transpose(-2, -1),
+        )
+
+        scores = scores / math.sqrt(
+            self.head_dim
+        )
+
+        # ------------------------------------------------
+        # LGP
+        # ------------------------------------------------
+
+        mu, sigma = self.lgp(x)
+
+        device = x.device
+
+        yy, xx = torch.meshgrid(
+            torch.linspace(
+                0,
+                1,
+                grid_h,
+                device=device,
+            ),
+            torch.linspace(
+                0,
+                1,
+                grid_w,
+                device=device,
+            ),
+            indexing="ij",
+        )
+
+        coords = torch.stack(
+            [
+                xx.reshape(-1),
+                yy.reshape(-1),
+            ],
+            dim=-1,
+        )
+
+        coords = coords.unsqueeze(0).unsqueeze(0)
+
+        mu = mu.unsqueeze(2)
+
+        sigma = sigma.unsqueeze(2)
+
+        diff = coords - mu
+
+        gaussian = -0.5 * (
+            diff[..., 0] ** 2
+            / sigma[..., 0] ** 2
+            +
+            diff[..., 1] ** 2
+            / sigma[..., 1] ** 2
+        )
+
+        gaussian = gaussian.unsqueeze(1)
+
+        scores = scores + gaussian
+
+        # ------------------------------------------------
+        # ARM
+        # ------------------------------------------------
+
+        if (
+            self.use_arm
+            and coverage is not None
+        ):
+            arm_map = coverage.reshape(
+                b,
+                1,
+                grid_h,
+                grid_w,
+            )
+
+            arm_map = self.arm(
+                arm_map
+            )
+
+            arm_map = self.arm_out(
+                arm_map
+            )
+
+            arm_map = arm_map.reshape(
+                b,
+                1,
+                1,
+                n,
+            )
+
+            scores = scores + arm_map
+
+        # ------------------------------------------------
+        # visual mask
+        # ------------------------------------------------
+
+        if memory_mask is not None:
+            scores = scores.masked_fill(
+                ~memory_mask[:, None, None, :],
+                -torch.finfo(scores.dtype).max,
+            )
+
+        attention = F.softmax(
+            scores,
+            dim=-1,
+        )
+
+        attention = self.dropout(
+            attention
+        )
+
+        out = torch.matmul(
+            attention,
+            v,
+        )
+
+        out = out.transpose(
+            1,
+            2,
+        ).reshape(
+            b,
+            t,
+            d,
+        )
+
+        out = self.out(out)
+
+        # 用 head 平均 attention 更新 coverage
+        mean_attention = attention.mean(
+            dim=1
+        )
+
+        return (
+            out,
+            mean_attention,
+            mu,
+        )
+
+
+class DecoderSelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim=256,
+        heads=8,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+    def forward(
+        self,
+        x,
+        padding_mask=None,
+    ):
+        t = x.shape[1]
+
+        causal_mask = torch.triu(
+            torch.ones(
+                t,
+                t,
+                device=x.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+
+        y = self.norm(x)
+
         y, _ = self.attn(
-            self.n1(x),
-            self.n1(x),
-            self.n1(x),
+            y,
+            y,
+            y,
             attn_mask=causal_mask,
+            key_padding_mask=padding_mask,
             need_weights=False,
         )
-        x = x + self.drop(y)
-        return x + self.drop(self.ff(self.ff_norm(x)))
+
+        return x + self.dropout(y)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(
+        self,
+        dim=256,
+        heads=8,
+        ff_dim=1024,
+        dropout=0.1,
+        use_arm=False,
+    ):
+        super().__init__()
+
+        self.self_attn = DecoderSelfAttention(
+            dim=dim,
+            heads=heads,
+            dropout=dropout,
+        )
+
+        self.cross_norm = nn.LayerNorm(
+            dim
+        )
+
+        self.cross_attn = GaussianCrossAttention(
+            dim=dim,
+            heads=heads,
+            dropout=dropout,
+            use_arm=use_arm,
+        )
+
+        self.ff_norm = nn.LayerNorm(
+            dim
+        )
+
+        self.ff = FeedForward(
+            dim=dim,
+            hidden_dim=ff_dim,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        x,
+        memory,
+        grid_h,
+        grid_w,
+        token_padding_mask=None,
+        memory_mask=None,
+        coverage=None,
+    ):
+        x = self.self_attn(
+            x,
+            padding_mask=token_padding_mask,
+        )
+
+        cross_out, attention, mu = (
+            self.cross_attn(
+                self.cross_norm(x),
+                memory,
+                grid_h,
+                grid_w,
+                memory_mask=memory_mask,
+                coverage=coverage,
+            )
+        )
+
+        x = x + cross_out
+
+        x = x + self.ff(
+            self.ff_norm(x)
+        )
+
+        return (
+            x,
+            attention,
+            mu,
+        )
 
 
 class SpatialHMER(nn.Module):
     def __init__(
         self,
         vocab_size,
-        dim=256,
-        heads=8,
+        pad_id,
+        model_dim=256,
+        num_heads=8,
         decoder_depth=3,
+        ff_dim=1024,
         max_len=150,
-        pad_id=0,
-        entity_ids=None,
+        dropout=0.1,
     ):
         super().__init__()
-        self.dim = dim
-        self.max_len = max_len
+
+        self.model_dim = model_dim
+
         self.pad_id = pad_id
 
-        self.backbone = ConvBackbone(dim)
-        self.encoder = GeometryEncoder(dim, depth=3, heads=heads)
+        self.max_len = max_len
 
-        self.token_emb = nn.Embedding(vocab_size, dim, padding_idx=pad_id)
-        self.pos = nn.Parameter(torch.randn(1, max_len, dim) * 0.02)
+        # ------------------------------------------------
+        # Encoder
+        # ------------------------------------------------
 
-        self.self1 = SelfBlock(dim, heads)
-        self.lgp = GaussianCrossAttention(dim, heads)
+        self.backbone = ConvBackbone()
 
-        self.xt_decoder = ContinuousTransformerWrapper(
-            dim_in=dim,
-            dim_out=dim,
+        self.encoder_proj = nn.Conv2d(
+            256,
+            model_dim,
+            kernel_size=1,
+        )
+
+        self.geometry_encoder = GeometryEncoder(
+            dim=model_dim,
+            depth=3,
+            heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+        )
+
+        # ------------------------------------------------
+        # Decoder
+        # ------------------------------------------------
+
+        self.token_emb = nn.Embedding(
+            vocab_size,
+            model_dim,
+            padding_idx=pad_id,
+        )
+
+        self.pos = nn.Parameter(
+            torch.randn(
+                1,
+                max_len,
+                model_dim,
+            ) * 0.02
+        )
+
+        self.decoder_layers = nn.ModuleList()
+
+        for i in range(decoder_depth):
+            # ARM 从第二层开始
+            use_arm = i >= 1
+
+            self.decoder_layers.append(
+                DecoderBlock(
+                    dim=model_dim,
+                    heads=num_heads,
+                    ff_dim=ff_dim,
+                    dropout=dropout,
+                    use_arm=use_arm,
+                )
+            )
+
+        self.norm = nn.LayerNorm(
+            model_dim
+        )
+
+        self.head = nn.Linear(
+            model_dim,
+            vocab_size,
+        )
+
+        # ------------------------------------------------
+        # x_transformers
+        #
+        # 保留一个轻量的 FF/Transformer refinement。
+        # ------------------------------------------------
+
+        self.refine = ContinuousTransformerWrapper(
+            dim=model_dim,
             max_seq_len=max_len,
             attn_layers=Decoder(
-                dim=dim,
-                depth=max(1, decoder_depth - 1),
-                heads=heads,
-                cross_attend=True,
-                ff_glu=True,
-                rotary_pos_emb=True,
+                dim=model_dim,
+                depth=1,
+                heads=num_heads,
+                ff_mult=4,
+                cross_attend=False,
             ),
         )
 
-        self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, vocab_size)
-        self.entity_ids = set(entity_ids or [])
+    # ====================================================
+    # Encoder
+    # ====================================================
 
-    def entity_mask(self, tokens):
-        if not self.entity_ids:
-            return torch.ones_like(tokens, dtype=torch.bool)
+    def _downsample_mask(
+        self,
+        image_mask,
+        grid_h,
+        grid_w,
+    ):
+        """
+        image_mask:
+            [B, W]
 
-        mask = torch.zeros_like(tokens, dtype=torch.bool)
-        for token_id in self.entity_ids:
-            mask |= tokens == token_id
+        CNN 一共 4 次 stride=2，
+        所以 feature width 大约为 W/16。
+
+        使用 adaptive max pooling 保证：
+        只要一个 feature cell 对应的原图区域存在，
+        就认为该 cell 有效。
+        """
+
+        mask = image_mask.float()
+
+        mask = F.adaptive_max_pool1d(
+            mask.unsqueeze(1),
+            grid_w,
+        )
+
+        mask = mask.squeeze(1) > 0.5
+
         return mask
 
-    def encode(self, images):
-        features = self.backbone(images)
-        return self.encoder(features)
+    def encode(
+        self,
+        images,
+        image_mask=None,
+    ):
+        x = self.backbone(
+            images
+        )
 
-    def decode_hidden(self, tokens, memory, grid_h, grid_w):
-        if tokens.shape[1] > self.max_len:
-            raise ValueError(
-                f"Sequence length {tokens.shape[1]} exceeds max_len={self.max_len}"
+        x = self.encoder_proj(
+            x
+        )
+
+        b, d, h, w = x.shape
+
+        grid_h = h
+        grid_w = w
+
+        # --------------------------------------------
+        # visual mask
+        # --------------------------------------------
+
+        if image_mask is not None:
+            memory_mask = (
+                self._downsample_mask(
+                    image_mask,
+                    grid_h,
+                    grid_w,
+                )
+            )
+        else:
+            memory_mask = torch.ones(
+                b,
+                h * w,
+                dtype=torch.bool,
+                device=x.device,
             )
 
-        x = self.token_emb(tokens) + self.pos[:, : tokens.shape[1]]
-        x = self.self1(x)
-        x, attention, mu = self.lgp(
-            x,
-            memory,
-            grid_h=grid_h,
-            grid_w=grid_w,
-            entity_mask=self.entity_mask(tokens),
-        )
-        x = self.xt_decoder(x, context=memory)
-        return self.norm(x), attention, mu
+        # --------------------------------------------
+        # flatten
+        # --------------------------------------------
 
-    def forward(self, images, tokens):
-        memory, grid_h, grid_w = self.encode(images)
-        hidden, attention, mu = self.decode_hidden(
-            tokens, memory, grid_h, grid_w
+        x = x.flatten(
+            2
+        ).transpose(
+            1,
+            2,
         )
-        logits = self.head(hidden)
-        return logits, {"attention": attention, "mu": mu}
+
+        # --------------------------------------------
+        # geometry coordinates
+        # --------------------------------------------
+
+        yy, xx = torch.meshgrid(
+            torch.linspace(
+                0,
+                1,
+                grid_h,
+                device=x.device,
+            ),
+            torch.linspace(
+                0,
+                1,
+                grid_w,
+                device=x.device,
+            ),
+            indexing="ij",
+        )
+
+        coords = torch.stack(
+            [
+                xx.flatten(),
+                yy.flatten(),
+            ],
+            dim=-1,
+        )
+
+        x = self.geometry_encoder(
+            x,
+            coords,
+            memory_mask,
+        )
+
+        x = x * memory_mask.unsqueeze(
+            -1
+        )
+
+        return (
+            x,
+            grid_h,
+            grid_w,
+            memory_mask,
+        )
+
+    # ====================================================
+    # Decoder
+    # ====================================================
+
+    def decode_hidden(
+        self,
+        tokens,
+        memory,
+        grid_h,
+        grid_w,
+        memory_mask=None,
+    ):
+        b, t = tokens.shape
+
+        if t > self.max_len:
+            raise ValueError(
+                f"Sequence length {t} > max_len {self.max_len}"
+            )
+
+        x = self.token_emb(
+            tokens
+        )
+
+        x = x + self.pos[
+            :,
+            :t,
+        ]
+
+        token_padding_mask = (
+            tokens == self.pad_id
+        )
+
+        coverage = None
+
+        last_attention = None
+        last_mu = None
+
+        for layer in self.decoder_layers:
+            (
+                x,
+                attention,
+                mu,
+            ) = layer(
+                x,
+                memory,
+                grid_h,
+                grid_w,
+                token_padding_mask=token_padding_mask,
+                memory_mask=memory_mask,
+                coverage=coverage,
+            )
+
+            last_attention = attention
+            last_mu = mu
+
+            # attention:
+            # [B, T, N]
+            #
+            # 每个 decoder token 对视觉区域的 attention
+            if attention is not None:
+                current_coverage = attention
+
+                if coverage is None:
+                    coverage = current_coverage
+                else:
+                    coverage = (
+                        coverage
+                        + current_coverage
+                    )
+
+        # x_transformers refinement
+        x = self.refine(
+            x
+        )
+
+        x = self.norm(
+            x
+        )
+
+        return (
+            x,
+            last_attention,
+            last_mu,
+        )
+
+    def forward(
+        self,
+        images,
+        tokens,
+        image_mask=None,
+    ):
+        (
+            memory,
+            grid_h,
+            grid_w,
+            memory_mask,
+        ) = self.encode(
+            images,
+            image_mask,
+        )
+
+        hidden, attention, mu = (
+            self.decode_hidden(
+                tokens,
+                memory,
+                grid_h,
+                grid_w,
+                memory_mask,
+            )
+        )
+
+        logits = self.head(
+            hidden
+        )
+
+        return (
+            logits,
+            attention,
+        )
+
+    # ====================================================
+    # Autoregressive generation
+    # ====================================================
 
     @torch.no_grad()
-    def generate(self, image, bos_id, eos_id, max_len=150):
+    def generate(
+        self,
+        image,
+        bos_id,
+        eos_id,
+        max_len=150,
+        image_mask=None,
+    ):
         self.eval()
-        memory, grid_h, grid_w = self.encode(image)
 
-        ids = torch.full(
-            (image.size(0), 1),
-            bos_id,
-            device=image.device,
-            dtype=torch.long,
+        (
+            memory,
+            grid_h,
+            grid_w,
+            memory_mask,
+        ) = self.encode(
+            image,
+            image_mask,
         )
 
-        for _ in range(max_len - 1):
-            hidden, _, _ = self.decode_hidden(
-                ids, memory, grid_h, grid_w
-            )
-            logits = self.head(hidden[:, -1])
-            next_token = logits.argmax(dim=-1, keepdim=True)
-            ids = torch.cat([ids, next_token], dim=1)
+        batch_size = image.shape[0]
 
-            if (next_token == eos_id).all():
+        ids = torch.full(
+            (
+                batch_size,
+                1,
+            ),
+            bos_id,
+            dtype=torch.long,
+            device=image.device,
+        )
+
+        finished = torch.zeros(
+            batch_size,
+            dtype=torch.bool,
+            device=image.device,
+        )
+
+        for _ in range(
+            max_len - 1
+        ):
+            hidden, _, _ = (
+                self.decode_hidden(
+                    ids,
+                    memory,
+                    grid_h,
+                    grid_w,
+                    memory_mask,
+                )
+            )
+
+            logits = self.head(
+                hidden[:, -1]
+            )
+
+            next_token = logits.argmax(
+                dim=-1
+            )
+
+            next_token = torch.where(
+                finished,
+                torch.full_like(
+                    next_token,
+                    eos_id,
+                ),
+                next_token,
+            )
+
+            ids = torch.cat(
+                [
+                    ids,
+                    next_token.unsqueeze(1),
+                ],
+                dim=1,
+            )
+
+            finished |= (
+                next_token == eos_id
+            )
+
+            if finished.all():
                 break
 
         return ids

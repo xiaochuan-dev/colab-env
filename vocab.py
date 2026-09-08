@@ -1,76 +1,146 @@
-import json
 import re
 from collections import Counter
-from pathlib import Path
 
-SPECIALS = ["<pad>", "<bos>", "<eos>", "<unk>"]
+
+SPECIALS = [
+    "<pad>",
+    "<bos>",
+    "<eos>",
+    "<unk>",
+]
+
+
+def tokenize_latex(s: str):
+    """
+    同时兼容：
+
+        \\frac { x } { y }
+
+    和：
+
+        \\frac{x}{y}
+
+    这种 LaTeX。
+    """
+    s = s.strip()
+
+    if not s:
+        return []
+
+    # Im2LaTeX-100K 原始数据很多公式已经是空格分词形式。
+    # 但是这里不直接简单 split，避免遇到混合格式。
+    pattern = r"\\[A-Za-z]+|\\.|[{}\_^&]|[^\s{}_^&\\]|[^\s]"
+
+    tokens = re.findall(pattern, s)
+
+    return tokens
 
 
 class Vocab:
     def __init__(self, stoi):
         self.stoi = stoi
-        self.itos = {i: s for s, i in stoi.items()}
-        self.pad_id = stoi["<pad>"]
-        self.bos_id = stoi["<bos>"]
-        self.eos_id = stoi["<eos>"]
-        self.unk_id = stoi["<unk>"]
+        self.itos = {v: k for k, v in stoi.items()}
+
+        self.pad_id = self.stoi["<pad>"]
+        self.bos_id = self.stoi["<bos>"]
+        self.eos_id = self.stoi["<eos>"]
+        self.unk_id = self.stoi["<unk>"]
+
+    @classmethod
+    def build(
+        cls,
+        formulas,
+        min_freq=1,
+    ):
+        counter = Counter()
+
+        for formula in formulas:
+            counter.update(tokenize_latex(formula))
+
+        tokens = [
+            token
+            for token, freq in counter.items()
+            if freq >= min_freq
+        ]
+
+        # 保证确定性的 vocab
+        tokens.sort()
+
+        itos = SPECIALS + tokens
+
+        stoi = {
+            token: idx
+            for idx, token in enumerate(itos)
+        }
+
+        return cls(stoi)
 
     def __len__(self):
         return len(self.stoi)
 
-    def encode(self, tokens, max_len):
+    def encode(
+        self,
+        tokens,
+        max_len,
+    ):
+        """
+        [BOS] token... [EOS]
+
+        max_len 是最终 sequence 长度。
+        """
+
         if max_len < 2:
             raise ValueError("max_len must be >= 2")
-        ids = [self.bos_id]
-        ids += [self.stoi.get(t, self.unk_id) for t in tokens[: max_len - 2]]
-        ids += [self.eos_id]
+
+        tokens = tokens[: max_len - 2]
+
+        ids = [
+            self.bos_id,
+            *[
+                self.stoi.get(token, self.unk_id)
+                for token in tokens
+            ],
+            self.eos_id,
+        ]
+
         return ids
 
-    def decode(self, ids):
-        out = []
-        for i in ids:
-            token = self.itos.get(int(i), "<unk>")
-            if token == "<eos>":
-                break
-            if token not in SPECIALS:
-                out.append(token)
-        return " ".join(out)
+    def decode(
+        self,
+        ids,
+        remove_special=True,
+    ):
+        tokens = []
 
-    def save(self, path):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(self.stoi, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        for idx in ids:
+            token = self.itos.get(int(idx), "<unk>")
 
-    @classmethod
-    def load(cls, path):
-        return cls(json.loads(Path(path).read_text(encoding="utf-8")))
+            if remove_special and token in SPECIALS:
+                continue
 
+            tokens.append(token)
 
-def tokenize_latex(s):
-    """Tokenize both the space-separated HF formulas and compact LaTeX."""
-    s = s.strip()
-    if not s:
-        return []
+        return tokens
 
-    if " " in s:
-        return s.split()
+    def decode_latex(self, ids):
+        """
+        用于最终查看预测结果。
+        """
+        tokens = self.decode(ids)
 
-    return re.findall(r"\\[A-Za-z]+|[{}_^&]|\\.|[^\s]", s)
+        output = ""
 
+        for token in tokens:
+            if token.startswith("\\"):
+                output += token
+            elif token in {
+                "{",
+                "}",
+                "_",
+                "^",
+            }:
+                output += token
+            else:
+                output += token
 
-def build_vocab_from_formulas(formulas, min_freq=1, max_items=None):
-    counter = Counter()
-    for formula in formulas:
-        counter.update(tokenize_latex(formula))
-
-    items = [token for token, count in counter.most_common() if count >= min_freq]
-    if max_items is not None:
-        items = items[:max_items]
-
-    stoi = {token: i for i, token in enumerate(SPECIALS)}
-    for token in items:
-        if token not in stoi:
-            stoi[token] = len(stoi)
-    return Vocab(stoi)
+        return output
