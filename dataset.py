@@ -51,7 +51,7 @@ class Im2LatexHF(Dataset):
         nw = min(self.max_width, nw)
 
         image = image.resize((nw, self.image_height), Image.Resampling.BILINEAR)
-        x = torch.from_numpy(np.asarray(image)).float() / 255.0
+        x = torch.from_numpy(np.asarray(image).copy()).float() / 255.0
         x = 1.0 - x
         return x.unsqueeze(0)
 
