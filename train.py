@@ -21,8 +21,8 @@ DATA_CACHE_DIR = Path("./data/huggingface")
 OUTPUT_DIR = Path("./checkpoints/lgp")
 
 EPOCHS = 25
-BATCH_SIZE = 8
-NUM_WORKERS = 4
+BATCH_SIZE = 64
+NUM_WORKERS = 2
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
 MAX_LEN = 150
