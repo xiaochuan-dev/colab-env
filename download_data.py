@@ -1,224 +1,151 @@
+
 #!/usr/bin/env python3
 """
-自动下载并整理公式识别数据集，适配本项目的 data/im2latexv2/ 格式。
+从 Hugging Face 自动下载公式识别数据集，并整理成项目需要的格式：
+  data/im2latexv2/
+    images/
+    formulas.txt   # 每行: image_name.png\\t latex
 
-说明：
-  - 官方 MathNet im2latexv2 完整版约 40GB+（Zenodo Part1+Part2），体积过大，
-    本脚本默认下载更常用、体积可控的 **im2latex-100k 处理后版本**（Harvard / Deng et al.）。
-  - 如需完整 im2latexv2，请手动从下面链接下载后按 README 整理。
+默认使用 yuntian-deng/im2latex-100k（经典 im2latex-100k，HF 上快）。
+也可切换为更大的 OleehyO/latex-formulas (cleaned_formulas, ~550K)。
 
-完整 im2latexv2（MathNet）:
-  Part1: https://zenodo.org/records/11230382  (~40.6 GB)
-  Part2: https://zenodo.org/records/11296280
-  解压脚本: unpack_im2latexv2.py（随 Part1 提供）
-
-本脚本下载的是经典 im2latex-100k 处理后数据，可直接训练。
+用法:
+  pip install datasets pillow
+  python download_data.py
 """
 
 import os
 import sys
-import tarfile
-import zipfile
-import urllib.request
-import shutil
 from pathlib import Path
 
-# -------------------- 配置（与 config.py 对齐） --------------------
+# -------------------- 配置 --------------------
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data" / "im2latexv2"
 IMAGE_DIR = DATA_ROOT / "images"
 FORMULA_FILE = DATA_ROOT / "formulas.txt"
-TMP_DIR = ROOT / "data" / "_tmp_download"
 
-# 经典 im2latex-100k 处理后资源（公开镜像，体积相对可控）
-# 来源: https://im2markup.yuntiandeng.com/data/  与 Zenodo 56198
-URLS = {
-    # 处理后图片（cropped / padded，便于训练）
-    "images": "https://zenodo.org/records/56198/files/formula_images.tar.gz?download=1",
-    # 归一化公式列表
-    "formulas": "https://zenodo.org/records/56198/files/im2latex_formulas.norm.lst?download=1",
-    # 划分文件（可选）
-    "train": "https://zenodo.org/records/56198/files/im2latex_train.lst?download=1",
-    "val": "https://zenodo.org/records/56198/files/im2latex_validate.lst?download=1",
-    "test": "https://zenodo.org/records/56198/files/im2latex_test.lst?download=1",
-}
+# 可选数据集（在 HF 上）
+# 1) 经典 im2latex-100k（推荐，体积小、经典基准）
+HF_DATASET = "yuntian-deng/im2latex-100k"
+HF_CONFIG = None          # 无 config 名
+HF_SPLIT = None           # 加载全部 split 再合并
 
-# 备用：如果上面失败，可改用其他镜像（用户自行替换）
-# 例如 Kaggle / HuggingFace 等需要额外鉴权的源
+# 2) 更大清洗版（约 550K），取消下面注释即可切换：
+# HF_DATASET = "OleehyO/latex-formulas"
+# HF_CONFIG = "cleaned_formulas"
+# HF_SPLIT = "train"
 
+# 最多保存多少条（None=全部；调试可设 5000）
+MAX_SAMPLES = None
 
-def download(url: str, dest: Path, desc: str = ""):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and dest.stat().st_size > 0:
-        print(f"[skip] 已存在: {dest}")
-        return
-    print(f"[download] {desc or url}")
-    print(f"  -> {dest}")
-    try:
-        def _progress(block_num, block_size, total_size):
-            if total_size <= 0:
-                return
-            downloaded = block_num * block_size
-            pct = min(100.0, downloaded * 100.0 / total_size)
-            mb = downloaded / (1024 * 1024)
-            sys.stdout.write(f"\r  {pct:5.1f}%  ({mb:.1f} MB)")
-            sys.stdout.flush()
-
-        urllib.request.urlretrieve(url, dest, reporthook=_progress)
-        print()
-    except Exception as e:
-        print(f"\n[ERROR] 下载失败: {e}")
-        print("请手动下载后放到 data/_tmp_download/ 目录，或更换镜像 URL。")
-        raise
-
-
-def extract_tar(tar_path: Path, out_dir: Path):
-    print(f"[extract] {tar_path.name} -> {out_dir}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tar_path, "r:gz") as tar:
-        tar.extractall(out_dir)
-
-
-def build_formulas_txt(formulas_lst: Path, image_root: Path, out_file: Path):
-    """
-    把 im2latex 原始列表转成项目需要的:
-      image_name.png\\t latex
-    原始 norm.lst 每行一条公式；图片名通常是 数字.png 或与 lst 行号对应。
-    经典结构：formula_images/ 下有 xxx.png，lst 文件给出 formula 与 image 对应关系。
-    """
-    print("[convert] 生成 formulas.txt ...")
-    # 尝试多种常见布局
-    # 布局1: 图片已解压到 image_root，文件名与某种 index 对应
-    # 布局2: 有 im2latex_*.lst 记录 "formula_idx image_name render_type"
-
-    # 先读所有公式
-    formulas = []
-    with open(formulas_lst, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                formulas.append(line)
-
-    # 收集图片
-    img_files = {}
-    for p in image_root.rglob("*"):
-        if p.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-            img_files[p.stem] = p
-            img_files[p.name] = p
-
-    lines = []
-    # 若图片名是 0.png, 1.png ... 与公式行号对齐
-    matched = 0
-    for i, latex in enumerate(formulas):
-        candidates = [
-            str(i),
-            f"{i}.png",
-            f"{i:07d}",
-            f"{i:07d}.png",
-        ]
-        found = None
-        for c in candidates:
-            if c in img_files:
-                found = img_files[c]
-                break
-            # 也试纯数字 stem
-            if Path(c).stem in img_files:
-                found = img_files[Path(c).stem]
-                break
-        if found is None:
-            continue
-        # 复制/软链到统一 images/ 目录（用相对名）
-        rel_name = found.name
-        target = IMAGE_DIR / rel_name
-        if not target.exists():
-            try:
-                os.link(found, target)  # hardlink 省空间
-            except OSError:
-                shutil.copy2(found, target)
-        # latex 里空格分隔的 token 拼回（norm.lst 通常已空格分词）
-        latex_clean = latex.replace(" ", "")
-        # 更稳妥：保留空格分词形式也可，本项目 vocab 支持两种
-        lines.append(f"{rel_name}\t{latex}")
-        matched += 1
-
-    if matched == 0:
-        # 回退：只要有图片就按文件名顺序硬配对（仅用于冒烟）
-        print("[WARN] 无法按 index 对齐，尝试按文件名排序硬配对（仅调试用）")
-        imgs_sorted = sorted([p for p in IMAGE_DIR.glob("*") if p.suffix.lower() == ".png"])
-        for i, img in enumerate(imgs_sorted):
-            if i >= len(formulas):
-                break
-            lines.append(f"{img.name}\t{formulas[i]}")
-            matched += 1
-
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"[done] 写入 {out_file} ，共 {matched} 条样本")
+# 国内可设镜像（可选）
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 
 def main():
-    print("=" * 60)
-    print("im2latex 数据自动下载脚本")
-    print("=" * 60)
-    print(f"目标目录: {DATA_ROOT}")
-    print()
-    print("注意: 完整 MathNet im2latexv2 约 40GB+，本脚本下载经典 im2latex-100k。")
-    print("完整 v2 请手动下载:")
-    print("  https://zenodo.org/records/11230382  (Part1)")
-    print("  https://zenodo.org/records/11296280  (Part2)")
-    print()
+    try:
+        from datasets import load_dataset
+        from PIL import Image
+    except ImportError:
+        print("请先安装: pip install datasets pillow")
+        sys.exit(1)
 
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    print("=" * 60)
+    print("从 Hugging Face 下载公式数据集")
+    print(f"  dataset : {HF_DATASET}")
+    print(f"  config  : {HF_CONFIG}")
+    print(f"  输出目录: {DATA_ROOT}")
+    print("=" * 60)
+
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. 下载
-    img_tar = TMP_DIR / "formula_images.tar.gz"
-    formulas_lst = TMP_DIR / "im2latex_formulas.norm.lst"
-
-    try:
-        download(URLS["images"], img_tar, "formula images (tar.gz)")
-        download(URLS["formulas"], formulas_lst, "normalized formulas")
-    except Exception:
-        print("\n若 Zenodo 下载失败，可手动把文件放到:")
-        print(f"  {img_tar}")
-        print(f"  {formulas_lst}")
-        print("然后重新运行本脚本。")
-        return
-
-    # 2. 解压图片
-    extract_root = TMP_DIR / "extracted_images"
-    if not any(extract_root.rglob("*.png")):
-        extract_tar(img_tar, extract_root)
+    # 加载
+    print("[1/3] load_dataset ...")
+    if HF_CONFIG:
+        ds = load_dataset(HF_DATASET, HF_CONFIG, split=HF_SPLIT or "train")
     else:
-        print("[skip] 图片已解压")
+        # yuntian-deng/im2latex-100k 通常有 train/validation/test
+        raw = load_dataset(HF_DATASET)
+        if hasattr(raw, "keys"):
+            from datasets import concatenate_datasets
+            parts = []
+            for split_name in raw.keys():
+                print(f"  + split: {split_name} ({len(raw[split_name])})")
+                parts.append(raw[split_name])
+            ds = concatenate_datasets(parts) if len(parts) > 1 else parts[0]
+        else:
+            ds = raw
 
-    # 找到真正的图片目录
-    pngs = list(extract_root.rglob("*.png"))
-    if not pngs:
-        print("[ERROR] 解压后未找到 png，请检查 tar 内容")
-        return
-    # 把图片集中到 IMAGE_DIR
-    print(f"[copy] 共发现 {len(pngs)} 张图片，写入 {IMAGE_DIR}")
-    for p in pngs:
-        target = IMAGE_DIR / p.name
-        if not target.exists():
-            try:
-                os.link(p, target)
-            except OSError:
-                shutil.copy2(p, target)
+    n_total = len(ds)
+    n = n_total if MAX_SAMPLES is None else min(n_total, MAX_SAMPLES)
+    print(f"[2/3] 共 {n_total} 条，将写入 {n} 条")
 
-    # 3. 生成 formulas.txt
-    build_formulas_txt(formulas_lst, IMAGE_DIR, FORMULA_FILE)
+    sample0 = ds[0]
+    keys = list(sample0.keys())
+    print(f"  字段: {keys}")
+
+    def get_latex(ex):
+        for k in ("formula", "text", "latex", "latex_formula", "label"):
+            if k in ex and ex[k] is not None:
+                return str(ex[k]).strip()
+        raise KeyError(f"找不到公式字段，可用字段: {list(ex.keys())}")
+
+    def get_image(ex):
+        if "image" in ex:
+            return ex["image"]
+        raise KeyError("找不到 image 字段")
+
+    def get_name(ex, idx):
+        for k in ("filename", "id", "file_name", "image_path"):
+            if k in ex and ex[k]:
+                name = str(ex[k])
+                if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                    name = name + ".png"
+                return Path(name).name
+        return f"{idx:07d}.png"
+
+    lines = []
+    print("[3/3] 写出图片 + formulas.txt ...")
+    for i in range(n):
+        ex = ds[i]
+        latex = get_latex(ex)
+        img = get_image(ex)
+        name = get_name(ex, i)
+
+        if hasattr(img, "convert"):
+            img = img.convert("RGB")
+        else:
+            img = Image.open(img).convert("RGB")
+
+        out_path = IMAGE_DIR / name
+        if out_path.exists():
+            name = f"{i:07d}_{name}"
+            out_path = IMAGE_DIR / name
+        img.save(out_path, format="PNG")
+
+        latex = " ".join(latex.split())
+        lines.append(f"{name}\t{latex}")
+
+        if (i + 1) % 2000 == 0 or (i + 1) == n:
+            print(f"  {i+1}/{n}")
+
+    FORMULA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(FORMULA_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
     print()
     print("=" * 60)
-    print("完成！数据已准备好:")
-    print(f"  images/     -> {IMAGE_DIR}")
-    print(f"  formulas.txt -> {FORMULA_FILE}")
+    print("完成！")
+    print(f"  images/      : {IMAGE_DIR}  ({n} 张)")
+    print(f"  formulas.txt : {FORMULA_FILE}")
     print()
-    print("接下来直接运行:  python train.py")
+    print("接下来运行:  python train.py")
     print("=" * 60)
+    print()
+    print("切换更大数据集: 编辑本脚本，改用")
+    print('  HF_DATASET = "OleehyO/latex-formulas"')
+    print('  HF_CONFIG  = "cleaned_formulas"')
+    print("国内加速可设置: export HF_ENDPOINT=https://hf-mirror.com")
 
 
 if __name__ == "__main__":
