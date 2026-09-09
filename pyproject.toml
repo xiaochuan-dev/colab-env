@@ -3,15 +3,6 @@ name = "colab-env"
 version = "0.0.1"
 requires-python = "==3.12.*"
 dependencies = [
-    "paddlepaddle-gpu",
-    "paddleocr",
-    "paddlex[ocr]==3.7.2",
+    
 ]
 
-[tool.uv.sources]
-paddlepaddle-gpu = { index = "paddle-cu130" }
-
-[[tool.uv.index]]
-name = "paddle-cu130"
-url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
-explicit = true
