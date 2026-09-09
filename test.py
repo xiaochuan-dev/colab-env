@@ -8,7 +8,7 @@ import json
 from paddleocr import PaddleOCRVL
 
 
-BATCH_SIZE = 2
+BATCH_SIZE = 100
 
 
 def download_zip():
@@ -36,17 +36,15 @@ def recognize_formulas():
 
     # 获取所有图片
     img_paths = sorted(
-        [
-            str(path)
-            for path in formula_dir.iterdir()
-            if path.suffix.lower() in {
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".bmp",
-                ".webp",
-            }
-        ]
+        str(path)
+        for path in formula_dir.iterdir()
+        if path.suffix.lower() in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".webp",
+        }
     )
 
     total = len(img_paths)
@@ -58,73 +56,82 @@ def recognize_formulas():
     print(f"共找到 {total} 张公式图片")
     print(f"每批处理 {BATCH_SIZE} 张")
 
-    # 如果之前已经有结果，则继续使用已有结果
+    # 读取已有结果，实现断点续跑
     if output_path.exists():
         with open(output_path, "r", encoding="utf-8") as f:
             results = json.load(f)
 
-        print(f"已加载 {len(results)} 条已有结果")
+        print(f"已有 {len(results)} 条结果")
     else:
         results = {}
 
-    # 初始化模型，只初始化一次
+    # 模型只初始化一次
     pipeline = PaddleOCRVL()
 
-    # 按 1000 张一批
+    # 每 1000 张一批
     for start in range(0, total, BATCH_SIZE):
         end = min(start + BATCH_SIZE, total)
 
         batch_paths = img_paths[start:end]
 
-        # 跳过已经识别过的图片
+        # 跳过已经处理过的图片
         batch_paths = [
             path for path in batch_paths
             if path not in results
         ]
 
         if not batch_paths:
-            print(
-                f"[{start}:{end}] 已经处理过，跳过"
-            )
+            print(f"[{start + 1}-{end}] 已处理，跳过")
             continue
 
         print(
-            f"\n处理第 {start + 1} ~ {end} 张，"
-            f"本批 {len(batch_paths)} 张"
+            f"\n========== "
+            f"处理 {start + 1}-{end} / {total} "
+            f"=========="
         )
 
         try:
-            # 一次传入这一批图片
+            # 一次性传入这一批图片
             output = pipeline.predict(batch_paths)
 
-            # 保存本批结果
+            # 处理这一批的结果
             for img_path, res in zip(batch_paths, output):
+
                 try:
-                    data = res.json
+                    # 你的 PaddleOCRVL 返回结构：
+                    #
+                    # {
+                    #     "res": {
+                    #         "parsing_res_list": [...]
+                    #     }
+                    # }
+                    data = res.json["res"]
 
                     parts = []
 
-                    for block in data.get(
-                        "parsing_res_list", []
-                    ):
+                    for block in data.get("parsing_res_list", []):
                         content = block.get(
-                            "block_content", ""
+                            "block_content",
+                            ""
                         ).strip()
 
                         if content:
                             parts.append(content)
 
-                    value = "\n".join(parts).strip()
+                    value = "\n".join(parts)
 
                     results[img_path] = value
 
                 except Exception as e:
-                    print(f"处理结果失败: {img_path}")
+                    print(f"解析结果失败: {img_path}")
                     print(f"错误: {e}")
 
+                    # 失败也记录，避免下次无限重复
                     results[img_path] = ""
 
-            # ★ 每批处理完成后立即保存
+            # ==================================================
+            # ★ 每一批处理完成后立即保存 JSON
+            # ==================================================
             with open(
                 output_path,
                 "w",
@@ -138,19 +145,22 @@ def recognize_formulas():
                 )
 
             print(
-                f"第 {start + 1} ~ {end} 张处理完成"
+                f"本批完成：{start + 1}-{end}"
             )
             print(
-                f"当前已保存 {len(results)}/{total} 条"
+                f"当前进度：{len(results)} / {total}"
+            )
+            print(
+                f"JSON 已保存：{output_path}"
             )
 
         except Exception as e:
             print(
-                f"\n第 {start + 1} ~ {end} 批处理失败:"
+                f"\n第 {start + 1}-{end} 批识别失败"
             )
-            print(e)
+            print(f"错误: {e}")
 
-            # 即使这一批失败，也保存之前的结果
+            # 即使当前批失败，也保存之前已经完成的结果
             with open(
                 output_path,
                 "w",
@@ -163,11 +173,15 @@ def recognize_formulas():
                     indent=2,
                 )
 
-            print("已有结果已保存")
+            print("之前已经完成的结果已保存")
             raise
 
-    print("\n全部识别完成！")
-    print(f"结果文件: {output_path}")
+    print("\n================================")
+    print("全部识别完成！")
+    print(f"总图片数：{total}")
+    print(f"结果数量：{len(results)}")
+    print(f"结果文件：{output_path}")
+    print("================================")
 
 
 if __name__ == "__main__":
