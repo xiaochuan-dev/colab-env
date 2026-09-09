@@ -62,7 +62,7 @@ STRUCT_TOKENS = {
 }
 
 # -------------------- 训练 --------------------
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 EVAL_EVERY = 5
 MAX_DECODE_LEN = 120
 
