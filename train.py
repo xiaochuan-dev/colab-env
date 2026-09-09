@@ -5,7 +5,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 import config as cfg
@@ -28,7 +28,6 @@ def compute_exp_rate(preds, gts, vocab):
     total = len(preds)
     for p, g in zip(preds, gts):
         pred_str = vocab.decode(p.tolist())
-        # gt 已经是字符串
         if pred_str.replace(" ", "") == g.replace(" ", ""):
             correct += 1
     return correct / max(total, 1)
@@ -39,18 +38,15 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, vocab, device, 
     total_loss = 0.0
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]")
     for imgs, tgt, _ in pbar:
-        imgs = imgs.to(device)
-        tgt = tgt.to(device)
+        imgs = imgs.to(device, non_blocking=True)
+        tgt = tgt.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        with autocast(enabled=cfg.USE_AMP):
+        optimizer.zero_grad(set_to_none=True)
+        with autocast("cuda", enabled=cfg.USE_AMP):
             logits, mus = model(imgs, tgt, vocab=vocab)
-            # logits: (B, T-1, V)  vs tgt[:, 1:]
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt[:, 1:].reshape(-1))
 
-            # 可选 Spatial Grounding Loss（im2latexv2 默认 λ=0）
             if cfg.LAMBDA_SG > 0 and mus:
-                # 没有真实 bbox 时跳过；有则在这里加 SmoothL1
                 pass
 
         scaler.scale(loss).backward()
@@ -66,26 +62,30 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, vocab, device, 
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, vocab, device, epoch):
+def evaluate(model, loader, criterion, vocab, device, epoch, do_decode=True):
+    """
+    do_decode=False 时只算 val loss（快），
+    do_decode=True  时额外做 greedy decode 算 ExpRate（慢）。
+    """
     model.eval()
     total_loss = 0.0
     all_preds = []
     all_gts = []
     pbar = tqdm(loader, desc=f"Epoch {epoch} [val]")
     for imgs, tgt, raws in pbar:
-        imgs = imgs.to(device)
-        tgt = tgt.to(device)
-        with autocast(enabled=cfg.USE_AMP):
+        imgs = imgs.to(device, non_blocking=True)
+        tgt = tgt.to(device, non_blocking=True)
+        with autocast("cuda", enabled=cfg.USE_AMP):
             logits, _ = model(imgs, tgt, vocab=vocab)
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt[:, 1:].reshape(-1))
         total_loss += loss.item()
 
-        # greedy decode 评估
-        pred_ids = model.greedy_decode(imgs, vocab)
-        all_preds.extend(pred_ids.cpu())
-        all_gts.extend(raws)
+        if do_decode:
+            pred_ids = model.greedy_decode(imgs, vocab)
+            all_preds.extend(pred_ids.cpu())
+            all_gts.extend(raws)
 
-    exp_rate = compute_exp_rate(all_preds, all_gts, vocab)
+    exp_rate = compute_exp_rate(all_preds, all_gts, vocab) if do_decode else 0.0
     return total_loss / max(len(loader), 1), exp_rate
 
 
@@ -94,7 +94,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ---------- 词表 ----------
     vocab = Vocab()
     if os.path.exists(cfg.VOCAB_FILE):
         vocab.load(cfg.VOCAB_FILE)
@@ -105,10 +104,8 @@ def main():
         vocab.build(formulas)
         vocab.save(cfg.VOCAB_FILE)
 
-    # ---------- 数据 ----------
     train_loader, val_loader, test_loader = build_dataloaders(vocab)
 
-    # ---------- 模型 ----------
     model = LGP_HMER(len(vocab)).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params / 1e6:.2f}M")
@@ -121,7 +118,6 @@ def main():
         weight_decay=cfg.WEIGHT_DECAY,
     )
 
-    # cosine + warmup
     def lr_lambda(epoch):
         if epoch < cfg.WARMUP_EPOCHS:
             return (epoch + 1) / cfg.WARMUP_EPOCHS
@@ -129,20 +125,27 @@ def main():
         return 0.5 * (1.0 + np.cos(np.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler(enabled=cfg.USE_AMP)
+    scaler = GradScaler("cuda", enabled=cfg.USE_AMP)
 
     best_exp = 0.0
     for epoch in range(1, cfg.NUM_EPOCHS + 1):
         t0 = time.time()
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, criterion, vocab, device, epoch)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, scaler, criterion, vocab, device, epoch
+        )
         scheduler.step()
 
-        if epoch % cfg.EVAL_EVERY == 0:
-            val_loss, exp_rate = evaluate(model, val_loader, criterion, vocab, device, epoch)
-            print(f"Epoch {epoch}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-                  f"ExpRate={exp_rate*100:.2f}%  lr={optimizer.param_groups[0]['lr']:.6f}  "
-                  f"time={time.time()-t0:.1f}s")
+        do_decode = (epoch % cfg.EVAL_EVERY == 0) or (epoch == cfg.NUM_EPOCHS)
+        val_loss, exp_rate = evaluate(
+            model, val_loader, criterion, vocab, device, epoch, do_decode=do_decode
+        )
 
+        lr = optimizer.param_groups[0]["lr"]
+        if do_decode:
+            print(
+                f"Epoch {epoch}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+                f"ExpRate={exp_rate*100:.2f}%  lr={lr:.6f}  time={time.time()-t0:.1f}s"
+            )
             if exp_rate > best_exp:
                 best_exp = exp_rate
                 ckpt = {
@@ -155,6 +158,11 @@ def main():
                 path = os.path.join(cfg.CHECKPOINT_DIR, "best.pt")
                 torch.save(ckpt, path)
                 print(f"  >> saved best to {path}")
+        else:
+            print(
+                f"Epoch {epoch}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+                f"(skip decode)  lr={lr:.6f}  time={time.time()-t0:.1f}s"
+            )
 
         if epoch % cfg.SAVE_EVERY == 0:
             path = os.path.join(cfg.CHECKPOINT_DIR, f"epoch_{epoch}.pt")

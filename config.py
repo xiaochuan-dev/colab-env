@@ -62,7 +62,10 @@ STRUCT_TOKENS = {
 }
 
 # -------------------- 训练 --------------------
-BATCH_SIZE = 8
+BATCH_SIZE = 16
+EVAL_EVERY = 5
+MAX_DECODE_LEN = 120
+
 NUM_EPOCHS = 100
 LEARNING_RATE = 0.08
 MOMENTUM = 0.9
@@ -79,11 +82,9 @@ USE_AUG = True
 USE_AMP = True                  # 混合精度
 GRAD_CLIP = 5.0
 SAVE_EVERY = 5                  # 每多少 epoch 存一次
-EVAL_EVERY = 1
 
 # 推理
 BEAM_SIZE = 5
-MAX_DECODE_LEN = 200
 
 # 设备
 DEVICE = "cuda"                 # 自动检测会在 train.py 里覆盖
