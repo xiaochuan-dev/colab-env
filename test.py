@@ -8,7 +8,7 @@ import json
 from paddleocr import PaddleOCRVL
 
 
-BATCH_SIZE = 1000
+BATCH_SIZE = 2
 
 
 def download_zip():
@@ -26,8 +26,11 @@ def download_zip():
 
 
 def recognize_formulas():
-    formula_dir = Path("./imgs/a/formulas")
-    output_path = Path("./output/formulas.json")
+
+    d = 'a'
+
+    formula_dir = Path(f"./imgs/{d}/formulas")
+    output_path = Path(f"./output/formulas_{d}.json")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
