@@ -50,7 +50,12 @@ def main():
     print(f"[Train] train batches={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
 
     # 3. Model
-    model = FusionHMERModel(vocab_size).to(device)
+    model = FusionHMERModel(vocab_size)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model, device_ids=[0, 1])
+
+    model = model.to(device)
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Train] model params = {total_params / 1e6:.2f} M")
 
