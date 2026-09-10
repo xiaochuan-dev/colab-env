@@ -267,46 +267,184 @@ class FusionHMERModel(nn.Module):
 
         return seq, (h, w)
 
-    def decode_step(self, tgt_emb, memory, spatial_shape, past_lgp=None):
-        """单步解码，注入 LGP"""
+    def _extract_kv(self, attn_module, x):
+        """从 MultiheadAttention 中手动提取 K/V，用于缓存。
+        返回 (key, value)，shape 均为 (B, L, D_model)。
+        """
+        D = x.size(-1)
+        w = attn_module.in_proj_weight
+        b = attn_module.in_proj_bias
+        # Q 占 [0:D), K 占 [D:2D), V 占 [2D:3D)
+        w_k = w[D:2 * D]
+        w_v = w[2 * D:3 * D]
+        b_k = b[D:2 * D] if b is not None else None
+        b_v = b[2 * D:3 * D] if b is not None else None
+        k = F.linear(x, w_k, b_k)
+        v = F.linear(x, w_v, b_v)
+        return k, v
+
+    def decode_step(self, tgt_emb, memory, spatial_shape, past_kv=None, use_cache=False):
+        """
+        解码一步（或完整序列）。
+
+        past_kv: list of length N_DECODER_LAYERS，每个元素为
+                 (self_k, self_v, cross_k, cross_v) 或 None
+                 self_k/v : (B, past_len, D)
+                 cross_k/v: (B, mem_len, D)  — memory 投影可跨步复用
+        use_cache: True 时只对当前新 token 计算，并返回 updated past_kv
+
+        返回:
+            x: (B, T_cur, D)
+            new_past_kv: 仅当 use_cache=True 时返回
+        """
         h, w = spatial_shape
         B, T, _ = tgt_emb.shape
+        device = tgt_emb.device
 
+        if past_kv is None:
+            past_kv = [None] * len(self.decoder_layers)
+
+        new_past_kv = [] if use_cache else None
         x = tgt_emb
+
         for i, layer in enumerate(self.decoder_layers):
-            # masked self-attn
+            # ---------- Self-Attention (with optional KV cache) ----------
             residual = x
             x = layer["norm1"](x)
-            causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-            attn_out, _ = layer["self_attn"](x, x, x, attn_mask=causal_mask, need_weights=False)
+
+            if use_cache:
+                past = past_kv[i]
+                if past is not None:
+                    past_self_k, past_self_v, past_cross_k, past_cross_v = past
+                else:
+                    past_self_k = past_self_v = past_cross_k = past_cross_v = None
+
+                # 当前步 K/V
+                cur_k, cur_v = self._extract_kv(layer["self_attn"], x)
+                if past_self_k is not None:
+                    self_k = torch.cat([past_self_k, cur_k], dim=1)
+                    self_v = torch.cat([past_self_v, cur_v], dim=1)
+                else:
+                    self_k, self_v = cur_k, cur_v
+
+                # Q 只来自当前 token
+                D = x.size(-1)
+                w = layer["self_attn"].in_proj_weight
+                b = layer["self_attn"].in_proj_bias
+                w_q = w[:D]
+                b_q = b[:D] if b is not None else None
+                q = F.linear(x, w_q, b_q)  # (B, T, D)
+
+                n_heads = layer["self_attn"].num_heads
+                head_dim = D // n_heads
+
+                def reshape_heads(t):
+                    # (B, L, D) -> (B, n_heads, L, head_dim)
+                    return t.view(B, -1, n_heads, head_dim).transpose(1, 2)
+
+                q_h = reshape_heads(q)
+                k_h = reshape_heads(self_k)
+                v_h = reshape_heads(self_v)
+
+                scale = head_dim ** -0.5
+                attn_score = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale  # (B, H, T, past+T)
+                if T > 1:
+                    # 全量时仍需 causal mask
+                    causal_mask = torch.triu(
+                        torch.ones(T, self_k.size(1), device=device, dtype=torch.bool),
+                        diagonal=1
+                    )
+                    attn_score = attn_score.masked_fill(
+                        causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+                    )
+                attn_prob = F.softmax(attn_score, dim=-1)
+                attn_prob = F.dropout(attn_prob, p=DROPOUT, training=self.training)
+                attn_out_h = torch.matmul(attn_prob, v_h)  # (B, H, T, head_dim)
+                attn_out = attn_out_h.transpose(1, 2).contiguous().view(B, T, D)
+                attn_out = layer["self_attn"].out_proj(attn_out)
+            else:
+                # 全量计算（训练 / teacher-forcing）
+                causal_mask = torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
+                attn_out, _ = layer["self_attn"](x, x, x, attn_mask=causal_mask, need_weights=False)
+                self_k = self_v = None
+
             x = residual + self.dropout(attn_out)
 
-            # cross-attn + LGP (只在第一层强注入)
+            # ---------- Cross-Attention + LGP ----------
             residual = x
             x = layer["norm2"](x)
-            # 标准 content attention
-            attn_out, attn_weights = layer["cross_attn"](x, memory, memory, need_weights=True)
 
-            if i == 0:
-                # 用当前步的 hidden 预测 LGP
-                # 取最后一步
-                last_state = x[:, -1]  # B D
-                g, mu, sigma = self.lgp(last_state, h, w)  # B L
-                # 把 g 作为 soft bias 加权到 attention（简化实现）
-                # attn_weights: B n_heads T L  -> 我们用平均
-                # 这里用 g 调制 memory 后再做一次轻量加权
-                g = g.unsqueeze(1)  # B 1 L
-                memory_g = memory * g.transpose(1, 2)  # 近似
-                attn_out2, _ = layer["cross_attn"](x, memory_g, memory_g, need_weights=False)
-                attn_out = 0.7 * attn_out + 0.3 * attn_out2
+            if use_cache:
+                # cross K/V 只依赖 memory，首次计算后复用
+                if past is not None and past_cross_k is not None:
+                    cross_k, cross_v = past_cross_k, past_cross_v
+                else:
+                    cross_k, cross_v = self._extract_kv(layer["cross_attn"], memory)
+
+                D = x.size(-1)
+                w = layer["cross_attn"].in_proj_weight
+                b = layer["cross_attn"].in_proj_bias
+                w_q = w[:D]
+                b_q = b[:D] if b is not None else None
+                q = F.linear(x, w_q, b_q)
+
+                n_heads = layer["cross_attn"].num_heads
+                head_dim = D // n_heads
+
+                def reshape_heads(t):
+                    return t.view(B, -1, n_heads, head_dim).transpose(1, 2)
+
+                q_h = reshape_heads(q)
+                k_h = reshape_heads(cross_k)
+                v_h = reshape_heads(cross_v)
+
+                scale = head_dim ** -0.5
+                attn_score = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
+                attn_prob = F.softmax(attn_score, dim=-1)
+                attn_prob = F.dropout(attn_prob, p=DROPOUT, training=self.training)
+                attn_out_h = torch.matmul(attn_prob, v_h)
+                attn_out = attn_out_h.transpose(1, 2).contiguous().view(B, T, D)
+                attn_out = layer["cross_attn"].out_proj(attn_out)
+
+                # LGP 注入（仅第一层）
+                if i == 0:
+                    last_state = x[:, -1]
+                    g, mu, sigma = self.lgp(last_state, h, w)  # B L
+                    g = g.unsqueeze(1)  # B 1 L
+                    memory_g = memory * g.transpose(1, 2)
+                    cross_k_g, cross_v_g = self._extract_kv(layer["cross_attn"], memory_g)
+                    k_h_g = reshape_heads(cross_k_g)
+                    v_h_g = reshape_heads(cross_v_g)
+                    attn_score_g = torch.matmul(q_h, k_h_g.transpose(-2, -1)) * scale
+                    attn_prob_g = F.softmax(attn_score_g, dim=-1)
+                    attn_out_h_g = torch.matmul(attn_prob_g, v_h_g)
+                    attn_out2 = attn_out_h_g.transpose(1, 2).contiguous().view(B, T, D)
+                    attn_out2 = layer["cross_attn"].out_proj(attn_out2)
+                    attn_out = 0.7 * attn_out + 0.3 * attn_out2
+            else:
+                # 全量路径
+                attn_out, _ = layer["cross_attn"](x, memory, memory, need_weights=False)
+                if i == 0:
+                    last_state = x[:, -1]
+                    g, mu, sigma = self.lgp(last_state, h, w)
+                    g = g.unsqueeze(1)
+                    memory_g = memory * g.transpose(1, 2)
+                    attn_out2, _ = layer["cross_attn"](x, memory_g, memory_g, need_weights=False)
+                    attn_out = 0.7 * attn_out + 0.3 * attn_out2
+                cross_k = cross_v = None
 
             x = residual + self.dropout(attn_out)
 
-            # FFN
+            # ---------- FFN ----------
             residual = x
             x = layer["norm3"](x)
             x = residual + layer["ffn"](x)
 
+            if use_cache:
+                new_past_kv.append((self_k, self_v, cross_k, cross_v))
+
+        if use_cache:
+            return x, new_past_kv
         return x
 
     def forward(self, images, tgt_ids):
@@ -320,25 +458,35 @@ class FusionHMERModel(nn.Module):
         tgt_emb = self.token_emb(tgt_ids[:, :-1]) + self.decoder_pos[:, :tgt_ids.size(1)-1]
         tgt_emb = self.dropout(tgt_emb)
 
-        out = self.decode_step(tgt_emb, memory, spatial_shape)
+        out = self.decode_step(tgt_emb, memory, spatial_shape, use_cache=False)
         logits = self.out_proj(out)
         return logits
 
     @torch.no_grad()
     def generate(self, images, max_len=MAX_DECODE_LEN, sos_id=1, eos_id=2):
+        """带 KV Cache 的贪心解码。每步只计算当前 token，显著加速推理。"""
         memory, spatial_shape = self.encode(images)
         B = images.size(0)
         device = images.device
 
         ys = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
+        past_kv = None  # 初始无 cache
 
-        for _ in range(max_len):
-            tgt_emb = self.token_emb(ys) + self.decoder_pos[:, :ys.size(1)]
-            hidden = self.decode_step(tgt_emb, memory, spatial_shape)
-            logits = self.out_proj(hidden[:, -1])  # B V
+        for step in range(max_len):
+            # 只取最新一个 token 做 embedding
+            cur_ids = ys[:, -1:]                       # (B, 1)
+            pos = ys.size(1) - 1                       # 当前绝对位置
+            tgt_emb = self.token_emb(cur_ids) + self.decoder_pos[:, pos:pos+1]
+
+            hidden, past_kv = self.decode_step(
+                tgt_emb, memory, spatial_shape,
+                past_kv=past_kv, use_cache=True
+            )
+            logits = self.out_proj(hidden[:, -1])      # (B, V)
             next_token = logits.argmax(-1, keepdim=True)
             ys = torch.cat([ys, next_token], dim=1)
+
             finished = finished | (next_token.squeeze(1) == eos_id)
             if finished.all():
                 break
