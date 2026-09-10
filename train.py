@@ -1,10 +1,12 @@
 import os
 import random
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
 from config import *
@@ -12,6 +14,13 @@ from dataset import build_tokenizer_from_train, build_dataloaders, LaTeXTokenize
 from model import FusionHMERModel
 from metrics import evaluate
 
+def get_scheduler(optimizer, warmup_epochs, total_epochs):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return LambdaLR(optimizer, lr_lambda)
 
 def set_seed(seed):
     random.seed(seed)
@@ -45,11 +54,10 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Train] model params = {total_params / 1e6:.2f} M")
 
-    # 4. Optimizer & Scheduler
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = get_scheduler(optimizer, WARMUP_EPOCHS, EPOCHS)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # pad=0
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
 
     best_exprate = -1.0
     global_step = 0

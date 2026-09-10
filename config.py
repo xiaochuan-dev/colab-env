@@ -29,7 +29,7 @@ ENTITY_TOKENS = set()          # 运行时根据 vocab 填充（数字/字母/�
 # 训练
 BATCH_SIZE = 32
 NUM_WORKERS = 4
-LR = 1e-4
+LR = 3e-4
 WEIGHT_DECAY = 1e-4
 EPOCHS = 30
 WARMUP_EPOCHS = 2
