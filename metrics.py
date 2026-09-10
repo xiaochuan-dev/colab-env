@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import editdistance
 from sacrebleu.metrics import BLEU
 from tqdm import tqdm
@@ -42,6 +43,7 @@ def compute_exprate(refs, hyps):
 
 
 def evaluate(model, dataloader, tokenizer, device, desc="Eval"):
+    model = model.module if isinstance(model, nn.DataParallel) else model
     model.eval()
     all_refs = []
     all_hyps = []
