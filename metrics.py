@@ -43,8 +43,8 @@ def compute_exprate(refs, hyps):
 
 
 def evaluate(model, dataloader, tokenizer, device, desc="Eval"):
-    model = model.module if isinstance(model, nn.DataParallel) else model
-    model.eval()
+    real_model = model.module if isinstance(model, nn.DataParallel) else model
+    real_model.eval()
     all_refs = []
     all_hyps = []
 
@@ -53,7 +53,7 @@ def evaluate(model, dataloader, tokenizer, device, desc="Eval"):
         for imgs, ids, formulas in pbar:
             imgs = imgs.to(device)
             # generate
-            pred_ids = model.generate(imgs)
+            pred_ids = real_model.generate(imgs)
             for i in range(imgs.size(0)):
                 hyp = tokenizer.decode(pred_ids[i].cpu().tolist())
                 ref = formulas[i]
