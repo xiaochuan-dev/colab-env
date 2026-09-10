@@ -84,8 +84,7 @@ def main():
 
         # 评估
         if epoch % EVAL_INTERVAL == 0:
-            print("[Eval] running validation ...")
-            metrics = evaluate(model, val_loader, tokenizer, device)
+            metrics = evaluate(model, val_loader, tokenizer, device, desc=f"Val Epoch {epoch}")
             print(f"[Val] BLEU={metrics['BLEU']:.2f}  "
                   f"EditDist={metrics['EditDistance']:.4f}  "
                   f"ExpRate={metrics['ExpRate']:.2f}%  "
@@ -106,7 +105,7 @@ def main():
     print("\n[Test] loading best model and evaluating on test set ...")
     ckpt = torch.load(BEST_MODEL_PATH, map_location=device)
     model.load_state_dict(ckpt["model"])
-    test_metrics = evaluate(model, test_loader, tokenizer, device)
+    test_metrics = evaluate(model, test_loader, tokenizer, device, desc="Test")
     print(f"[Test] BLEU={test_metrics['BLEU']:.2f}  "
           f"EditDist={test_metrics['EditDistance']:.4f}  "
           f"ExpRate={test_metrics['ExpRate']:.2f}%")

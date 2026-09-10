@@ -1,6 +1,7 @@
 import torch
 import editdistance
 from sacrebleu.metrics import BLEU
+from tqdm import tqdm
 from config import *
 
 
@@ -40,22 +41,23 @@ def compute_exprate(refs, hyps):
     return correct / max(len(refs), 1) * 100.0
 
 
-def evaluate(model, dataloader, tokenizer, device):
+def evaluate(model, dataloader, tokenizer, device, desc="Eval"):
     model.eval()
     all_refs = []
     all_hyps = []
 
     with torch.no_grad():
-        for imgs, ids, formulas in dataloader:
+        pbar = tqdm(dataloader, desc=desc, leave=True)
+        for imgs, ids, formulas in pbar:
             imgs = imgs.to(device)
             # generate
             pred_ids = model.generate(imgs)
             for i in range(imgs.size(0)):
                 hyp = tokenizer.decode(pred_ids[i].cpu().tolist())
                 ref = formulas[i]
-                # 统一空格
                 all_hyps.append(hyp)
                 all_refs.append(ref)
+            pbar.set_postfix(samples=len(all_refs))
 
     bleu = compute_bleu(all_refs, all_hyps)
     ed = compute_edit_distance(all_refs, all_hyps)
