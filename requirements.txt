@@ -1,7 +1,8 @@
-torch
-torchvision
-datasets
-pillow
-numpy
-x-transformers
-tqdm
+torch>=2.0.0
+datasets>=2.14.0
+Pillow>=9.0.0
+sacrebleu>=2.3.0
+editdistance>=0.6.0
+tqdm>=4.65.0
+numpy>=1.23.0
+# torchvision 可选（本实现已用纯 PIL 替代，无需安装）

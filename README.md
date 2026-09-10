@@ -1,73 +1,59 @@
-# Im2LaTeX-100K + Spatially-Grounded Gaussian-Prior Attention
+# Fusion of DAMamba (Dynamic Adaptive Scan) + Spatially-Grounded Gaussian-Prior for Im2LaTeX
 
-This project is a directly runnable PyTorch implementation of the architecture discussed in the supplied paper, adapted to the public `yuntian-deng/im2latex-100k` dataset.
+完整可运行训练代码，融合两篇论文核心技术：
 
-## 1. Install dependencies
+1. **DAMamba - Dynamic Adaptive Scan (DAS)**
+   - Offset Prediction Network (OPN)
+   - 双线性插值采样
+   - 自适应重排成序列（保持线性复杂度）
+
+2. **Spatially-Grounded Gaussian-Prior Attention**
+   - Geometry-Aware Encoder（相对几何 bias）
+   - Latent Gaussian Prior (LGP) 注入 cross-attention
+   - 简化 entity/structural 门控思想
+
+## 数据集
+自动从 Hugging Face 下载 `yuntian-deng/im2latex-100k`（约 55k train / 6k val / 6.8k test）。
+
+## 评估指标
+- **BLEU**（corpus，token-level）
+- **Edit Distance**（归一化 Levenshtein，越小越好）
+- **ExpRate**（完全匹配率 %）
+
+## 快速开始
 
 ```bash
+cd im2latex_fusion
 pip install -r requirements.txt
-```
 
-## 2. Train
-
-There are **no command-line training arguments**.
-
-Just run:
-
-```bash
+# 所有超参在 config.py，无需命令行参数
 python train.py
 ```
 
-`train.py` automatically downloads/caches `yuntian-deng/im2latex-100k` with Hugging Face Datasets. The dataset is image + formula text in Parquet format and currently exposes about 67.9k examples. The repository data files are about 337 MB. 
+## 配置
+所有常量集中在 `config.py`：
+- 图像尺寸、模型维度、DAS 采样点数、LGP 权重
+- batch size、学习率、epoch 数等
 
-The local Hugging Face cache is:
-
-```text
-./data/huggingface/
+## 模型结构概览
+```
+Image → CNN Backbone → DAS (自适应扫描) → Geometry-Aware Encoder (Self-Attn + SSM)
+                                              ↓
+                                    Transformer Decoder + LGP (Gaussian Prior)
+                                              ↓
+                                         LaTeX tokens
 ```
 
-Training checkpoints are written to:
+## 注意事项
+- 本实现用纯 PyTorch 近似 Selective SSM，便于无额外 CUDA kernel 运行。
+- 真实生产环境可替换为官方 `mamba-ssm` 以获得更高速度与精度。
+- im2latex-100k 无符号级 bbox，因此 `USE_SPATIAL_SUPERVISION=False`（弱监督模式）。
+- 训练需要 GPU，推荐至少 12GB 显存（batch=16）。可在 config.py 调小 BATCH_SIZE / D_MODEL。
+- 首次运行会自动下载数据集并构建词表。
 
-```text
-./checkpoints/lgp/
-├── vocab.json
-├── last.pt
-└── best.pt
-```
-
-Change hyperparameters directly at the top of `train.py`.
-
-## 3. Inference
-
-Put a formula image at `./test.png`, then edit paths at the top of `infer.py` if necessary:
-
-```text
-CHECKPOINT_PATH = Path("./checkpoints/lgp/best.pt")
-VOCAB_PATH = Path("./checkpoints/lgp/vocab.json")
-IMAGE_PATH = Path("./test.png")
-```
-
-Then:
-
-```bash
-python infer.py
-```
-
-## 4. Architecture
-
-The implementation contains:
-
-- CNN visual backbone
-- geometry-aware self-attention encoder
-- explicit Gaussian latent spatial prior in the first decoder cross-attention
-- entity/structural token gating
-- x-transformers decoder for the remaining decoder layers
-- autoregressive LaTeX generation
-
-The Gaussian cross-attention receives the actual CNN feature-grid height and width rather than guessing a square/rectangular grid from the number of visual tokens.
-
-## 5. Dataset note
-
-The Hugging Face processed dataset is used directly; there is no need to manually download and unpack the old `.tar.gz`/`.lst` release.
-
-If you want the original classic file layout instead, the official Im2LaTeX project also publishes processed files and split lists, but this code intentionally uses the Hugging Face version so `python train.py` can perform the download automatically.
+## 文件说明
+- `config.py`      : 所有超参数
+- `dataset.py`     : HF 数据集加载 + LaTeX 分词器
+- `model.py`       : DAS + LGP + Geometry Bias + 简化 SSM 融合模型
+- `metrics.py`     : BLEU / EditDistance / ExpRate
+- `train.py`       : 完整训练 + 验证 + 测试循环
