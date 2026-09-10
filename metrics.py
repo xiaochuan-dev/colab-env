@@ -6,9 +6,9 @@ from sacrebleu.metrics import BLEU
 from tqdm import tqdm
 from config import *
 from concurrent.futures import ThreadPoolExecutor
+import copy
 
 def normalize_latex(s: str) -> str:
-    # ……（保持你原来的实现不变）……
     if s is None:
         return ""
     s = s.strip()
@@ -66,21 +66,29 @@ def compute_exprate(refs, hyps, use_normalize=True):
         correct = sum(1 for r, h in zip(refs, hyps) if r.strip() == h.strip())
     return correct / max(len(refs), 1) * 100.0
 
-def _generate_on_device(model, imgs, beam_size, device):
-    """在指定 device 上跑 generate"""
-    imgs = imgs.to(device)
-    with torch.cuda.device(device):
+def _generate_on_device(model, imgs, beam_size):
+    """模型已经在对应 device 上，直接跑"""
+    with torch.no_grad():
         pred_ids = model.generate(imgs, beam_size=beam_size)
     return pred_ids.cpu()
 
 def evaluate(model, dataloader, tokenizer, device, desc="Eval", beam_size=None):
-    # 始终拿到真正的模型（解包）
-    real_model = model.module if isinstance(model, nn.DataParallel) else model
-    real_model.eval()
+    # 拿到原始模型（解包 DataParallel）
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    base_model.eval()
 
     beam_size = beam_size if beam_size is not None else BEAM_SIZE
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
     use_multi_gpu = num_gpus >= 2
+
+    # 为两张卡各准备一份模型（只在第一次或需要时做）
+    if use_multi_gpu:
+        # 把当前权重复制到两张卡
+        model0 = copy.deepcopy(base_model).to("cuda:0").eval()
+        model1 = copy.deepcopy(base_model).to("cuda:1").eval()
+    else:
+        model0 = base_model.to(device).eval()
+        model1 = None
 
     all_refs = []
     all_hyps = []
@@ -91,29 +99,24 @@ def evaluate(model, dataloader, tokenizer, device, desc="Eval", beam_size=None):
             B = imgs.size(0)
 
             if use_multi_gpu and B >= 2:
-                # 把 batch 均分到两张卡
-                mid = B // 2
-                imgs1, imgs2 = imgs[:mid], imgs[mid:]
-                formulas1, formulas2 = formulas[:mid], formulas[mid:]
+                mid = (B + 1) // 2          # 尽量均衡
+                imgs0 = imgs[:mid].to("cuda:0", non_blocking=True)
+                imgs1 = imgs[mid:].to("cuda:1", non_blocking=True)
+                formulas0 = formulas[:mid]
+                formulas1 = formulas[mid:]
 
-                # 并行在两张卡上跑
                 with ThreadPoolExecutor(max_workers=2) as executor:
-                    fut1 = executor.submit(
-                        _generate_on_device, real_model, imgs1, beam_size, torch.device("cuda:0")
-                    )
-                    fut2 = executor.submit(
-                        _generate_on_device, real_model, imgs2, beam_size, torch.device("cuda:1")
-                    )
+                    fut0 = executor.submit(_generate_on_device, model0, imgs0, beam_size)
+                    fut1 = executor.submit(_generate_on_device, model1, imgs1, beam_size)
+                    pred0 = fut0.result()
                     pred1 = fut1.result()
-                    pred2 = fut2.result()
 
-                pred_ids = torch.cat([pred1, pred2], dim=0)
-                cur_formulas = formulas1 + formulas2
+                pred_ids = torch.cat([pred0, pred1], dim=0)
+                cur_formulas = formulas0 + formulas1
             else:
                 # 单卡 fallback
-                imgs = imgs.to(device)
-                pred_ids = real_model.generate(imgs, beam_size=beam_size)
-                pred_ids = pred_ids.cpu()
+                imgs = imgs.to(device, non_blocking=True)
+                pred_ids = _generate_on_device(model0, imgs, beam_size)
                 cur_formulas = formulas
 
             for i in range(pred_ids.size(0)):
@@ -123,6 +126,11 @@ def evaluate(model, dataloader, tokenizer, device, desc="Eval", beam_size=None):
                 all_refs.append(ref)
 
             pbar.set_postfix(samples=len(all_refs))
+
+    # 清理临时模型，释放显存
+    if use_multi_gpu:
+        del model0, model1
+        torch.cuda.empty_cache()
 
     bleu = compute_bleu(all_refs, all_hyps)
     ed = compute_edit_distance(all_refs, all_hyps)
