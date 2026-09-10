@@ -6,7 +6,38 @@ import numpy as np
 from collections import Counter
 import json
 import os
+import re
 from config import *
+
+
+def normalize_latex(s: str) -> str:
+    """与 metrics.py 保持一致的规范化，训练时对 GT 也规范化。"""
+    if s is None:
+        return ""
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\^([^{\\])", r"^{\1}", s)
+    s = re.sub(r"_([^{\\])", r"_{\1}", s)
+    s = re.sub(r"(\\[a-zA-Z]+)\^([^{\\])", r"\1^{\2}", s)
+    s = re.sub(r"(\\[a-zA-Z]+)_([^{\\])", r"\1_{\2}", s)
+    replacements = {
+        r"\geq": r"\ge",
+        r"\leq": r"\le",
+        r"\neq": r"\ne",
+        r"\rightarrow": r"\to",
+        r"\longrightarrow": r"\to",
+        r"\ldots": r"\dots",
+        r"\cdots": r"\dots",
+        r"\varphi": r"\phi",
+        r"\varepsilon": r"\epsilon",
+        r"\varnothing": r"\emptyset",
+    }
+    for a, b in replacements.items():
+        s = s.replace(a, b)
+    s = s.replace(r"\left", "")
+    s = s.replace(r"\right", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 class LaTeXTokenizer:
@@ -18,7 +49,7 @@ class LaTeXTokenizer:
     def build_vocab(self, formulas, min_freq=VOCAB_MIN_FREQ):
         counter = Counter()
         for f in formulas:
-            tokens = self._tokenize(f)
+            tokens = self._tokenize(normalize_latex(f))
             counter.update(tokens)
         for tok, cnt in counter.most_common():
             if cnt >= min_freq and tok not in self.token2id:
@@ -28,9 +59,7 @@ class LaTeXTokenizer:
         print(f"[Tokenizer] vocab size = {len(self.token2id)}")
 
     def _tokenize(self, formula: str):
-        # 简单空格分词 + 保留常见 LaTeX 命令
         formula = formula.strip()
-        # 更稳妥：按空格拆，并把 \{ \} ^ _ 等单独处理
         tokens = []
         i = 0
         s = formula
@@ -39,7 +68,6 @@ class LaTeXTokenizer:
                 i += 1
                 continue
             if s[i] == "\\" and i + 1 < len(s):
-                # 命令
                 j = i + 1
                 while j < len(s) and (s[j].isalpha() or s[j] in "^*_{}"):
                     j += 1
@@ -57,6 +85,7 @@ class LaTeXTokenizer:
         return tokens
 
     def encode(self, formula, max_len=MAX_FORMULA_LEN):
+        formula = normalize_latex(formula)
         tokens = self._tokenize(formula)[:max_len - 2]
         ids = [self.token2id.get(t, self.token2id["<unk>"]) for t in tokens]
         ids = [self.token2id["<sos>"]] + ids + [self.token2id["<eos>"]]
@@ -88,7 +117,6 @@ def get_image_transform():
     target_h, target_w = IMG_SIZE
 
     def transform(img: Image.Image):
-        # Resize 保持大致比例后 pad 到固定尺寸
         img = img.convert("L")
         w, h = img.size
         scale = min(target_w / max(w, 1), target_h / max(h, 1))
@@ -96,15 +124,14 @@ def get_image_transform():
         new_h = max(1, int(h * scale))
         img = img.resize((new_w, new_h), Image.BILINEAR)
 
-        # 中心 pad
         canvas = Image.new("L", (target_w, target_h), 255)
         left = (target_w - new_w) // 2
         top = (target_h - new_h) // 2
         canvas.paste(img, (left, top))
 
-        arr = np.array(canvas, dtype=np.float32) / 255.0  # [0,1]
-        arr = (arr - 0.5) / 0.5  # normalize
-        tensor = torch.from_numpy(arr).unsqueeze(0)  # 1 H W
+        arr = np.array(canvas, dtype=np.float32) / 255.0
+        arr = (arr - 0.5) / 0.5
+        tensor = torch.from_numpy(arr).unsqueeze(0)
         return tensor
 
     return transform
@@ -122,13 +149,14 @@ class Im2LatexDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.ds[idx]
-        img = item["image"].convert("L")  # 灰度
+        img = item["image"].convert("L")
         formula = item["formula"]
         img_t = self.transform(img)
         if self.tokenizer is None:
             return img_t, formula
         ids = self.tokenizer.encode(formula)
-        return img_t, torch.tensor(ids, dtype=torch.long), formula
+        # 返回规范化后的 formula 便于评测对齐
+        return img_t, torch.tensor(ids, dtype=torch.long), normalize_latex(formula)
 
 
 def collate_fn(batch):
@@ -137,7 +165,7 @@ def collate_fn(batch):
 
     max_len = min(max(len(x) for x in ids_list), MAX_SEQ_LEN)
     B = len(ids_list)
-    ids = torch.full((B, max_len), 0, dtype=torch.long)  # pad=0
+    ids = torch.full((B, max_len), 0, dtype=torch.long)
     for i, seq in enumerate(ids_list):
         L = min(len(seq), max_len)
         ids[i, :L] = seq[:L]

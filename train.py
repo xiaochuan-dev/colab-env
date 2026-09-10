@@ -13,6 +13,7 @@ from dataset import build_tokenizer_from_train, build_dataloaders, LaTeXTokenize
 from model import FusionHMERModel
 from metrics import evaluate
 
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -27,10 +28,12 @@ def main():
     print(f"[Train] device = {device}")
 
     # 1. Tokenizer
+    # 注意：改了 normalize 后建议删除旧 tokenizer.json 重新建词表
     if os.path.exists(TOKENIZER_PATH):
         tokenizer = LaTeXTokenizer()
         tokenizer.load(TOKENIZER_PATH)
         print(f"[Train] loaded tokenizer, vocab={len(tokenizer.token2id)}")
+        print("[Train] 若刚启用 normalize，建议删除 checkpoints/tokenizer.json 后重建")
     else:
         tokenizer = build_tokenizer_from_train()
 
@@ -41,11 +44,10 @@ def main():
     print(f"[Train] train batches={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
 
     # 3. Model
-
     print(f"可用 GPU 数量: {torch.cuda.device_count()}")
     model = FusionHMERModel(vocab_size)
     if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model, device_ids=[0, 1])
+        model = nn.DataParallel(model)
 
     model = model.to(device)
 
@@ -53,7 +55,6 @@ def main():
     print(f"[Train] model params = {total_params / 1e6:.2f} M")
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    # scheduler = get_scheduler(optimizer, WARMUP_EPOCHS, EPOCHS)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
@@ -89,19 +90,22 @@ def main():
         avg_loss = total_loss / len(train_loader)
         print(f"[Epoch {epoch}] train loss = {avg_loss:.4f}")
 
-        # 评估
+        # 评估（beam search + normalization）
         if epoch % EVAL_INTERVAL == 0:
             metrics = evaluate(model, val_loader, tokenizer, device, desc=f"Val Epoch {epoch}")
             print(f"[Val] BLEU={metrics['BLEU']:.2f}  "
                   f"EditDist={metrics['EditDistance']:.4f}  "
-                  f"ExpRate={metrics['ExpRate']:.2f}%  "
+                  f"ExpRate(norm)={metrics['ExpRate']:.2f}%  "
+                  f"ExpRate(raw)={metrics['ExpRate_raw']:.2f}%  "
                   f"(n={metrics['num_samples']})")
 
             if metrics["ExpRate"] > best_exprate:
                 best_exprate = metrics["ExpRate"]
+                # DataParallel 时保存 module 的权重更干净
+                state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
                 torch.save({
                     "epoch": epoch,
-                    "model": model.state_dict(),
+                    "model": state,
                     "optimizer": optimizer.state_dict(),
                     "exprate": best_exprate,
                     "vocab_size": vocab_size,
@@ -111,11 +115,15 @@ def main():
     # 最终测试
     print("\n[Test] loading best model and evaluating on test set ...")
     ckpt = torch.load(BEST_MODEL_PATH, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(ckpt["model"])
+    else:
+        model.load_state_dict(ckpt["model"])
     test_metrics = evaluate(model, test_loader, tokenizer, device, desc="Test")
     print(f"[Test] BLEU={test_metrics['BLEU']:.2f}  "
           f"EditDist={test_metrics['EditDistance']:.4f}  "
-          f"ExpRate={test_metrics['ExpRate']:.2f}%")
+          f"ExpRate(norm)={test_metrics['ExpRate']:.2f}%  "
+          f"ExpRate(raw)={test_metrics['ExpRate_raw']:.2f}%")
 
 
 if __name__ == "__main__":

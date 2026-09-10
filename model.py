@@ -467,27 +467,41 @@ class FusionHMERModel(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, images, max_len=MAX_DECODE_LEN, sos_id=1, eos_id=2):
-        """带 KV Cache 的贪心解码。每步只计算当前 token，显著加速推理。"""
+    def generate(self, images, max_len=MAX_DECODE_LEN, sos_id=1, eos_id=2,
+                 beam_size=None, length_penalty=None):
+        """
+        解码入口。
+        beam_size<=1: 带 KV Cache 的贪心
+        beam_size>1 : Beam Search（带长度惩罚）
+        """
+        beam_size = BEAM_SIZE if beam_size is None else beam_size
+        length_penalty = LENGTH_PENALTY if length_penalty is None else length_penalty
+
+        if beam_size is None or beam_size <= 1:
+            return self._generate_greedy(images, max_len, sos_id, eos_id)
+        return self._generate_beam(images, max_len, sos_id, eos_id, beam_size, length_penalty)
+
+    @torch.no_grad()
+    def _generate_greedy(self, images, max_len=MAX_DECODE_LEN, sos_id=1, eos_id=2):
+        """带 KV Cache 的贪心解码。"""
         memory, spatial_shape = self.encode(images)
         B = images.size(0)
         device = images.device
 
         ys = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-        past_kv = None  # 初始无 cache
+        past_kv = None
 
         for step in range(max_len):
-            # 只取最新一个 token 做 embedding
-            cur_ids = ys[:, -1:]                       # (B, 1)
-            pos = ys.size(1) - 1                       # 当前绝对位置
+            cur_ids = ys[:, -1:]
+            pos = ys.size(1) - 1
             tgt_emb = self.token_emb(cur_ids) + self.decoder_pos[:, pos:pos+1]
 
             hidden, past_kv = self.decode_step(
                 tgt_emb, memory, spatial_shape,
                 past_kv=past_kv, use_cache=True
             )
-            logits = self.out_proj(hidden[:, -1])      # (B, V)
+            logits = self.out_proj(hidden[:, -1])
             next_token = logits.argmax(-1, keepdim=True)
             ys = torch.cat([ys, next_token], dim=1)
 
@@ -495,3 +509,86 @@ class FusionHMERModel(nn.Module):
             if finished.all():
                 break
         return ys
+
+    @torch.no_grad()
+    def _generate_beam(self, images, max_len, sos_id, eos_id, beam_size, length_penalty):
+        """
+        标准 Beam Search。
+        为简化与正确性，对 batch 内每张图独立做 beam（避免复杂 mask）。
+        """
+        memory, spatial_shape = self.encode(images)
+        B = images.size(0)
+        device = images.device
+        V = self.vocab_size
+
+        # 最终输出 (B, L)
+        final_seqs = []
+
+        for b in range(B):
+            mem_b = memory[b:b+1]  # (1, Lmem, D)
+            # 每条 beam: (token_ids list, log_prob sum)
+            beams = [([sos_id], 0.0)]
+            finished_beams = []
+
+            for step in range(max_len):
+                candidates = []
+                # 收集未结束的 beam
+                active = [(seq, score) for seq, score in beams if seq[-1] != eos_id]
+                if not active:
+                    break
+
+                # 组 batch 前向
+                seqs = [seq for seq, _ in active]
+                max_t = max(len(s) for s in seqs)
+                # pad 到相同长度
+                inp = torch.full((len(seqs), max_t), 0, dtype=torch.long, device=device)
+                for i, seq in enumerate(seqs):
+                    inp[i, :len(seq)] = torch.tensor(seq, device=device)
+
+                # 扩展 memory
+                mem = mem_b.expand(len(seqs), -1, -1)
+                tgt_emb = self.token_emb(inp) + self.decoder_pos[:, :max_t]
+                hidden = self.decode_step(tgt_emb, mem, spatial_shape, use_cache=False)
+                logits = self.out_proj(hidden[:, -1])  # (n_active, V)
+                log_probs = F.log_softmax(logits, dim=-1)
+
+                for i, (seq, score) in enumerate(active):
+                    topk_logp, topk_ids = log_probs[i].topk(beam_size)
+                    for logp, tid in zip(topk_logp.tolist(), topk_ids.tolist()):
+                        new_seq = seq + [tid]
+                        new_score = score + logp
+                        if tid == eos_id:
+                            # 长度惩罚: score / L^alpha
+                            L = max(len(new_seq) - 1, 1)
+                            norm_score = new_score / (L ** length_penalty)
+                            finished_beams.append((new_seq, norm_score))
+                        else:
+                            candidates.append((new_seq, new_score))
+
+                # 保留 top beam_size 未完成
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                beams = candidates[:beam_size]
+
+                # 若已有足够完成的，可提前停
+                if len(finished_beams) >= beam_size and not beams:
+                    break
+
+            # 把还没结束的也按长度惩罚收进来
+            for seq, score in beams:
+                L = max(len(seq) - 1, 1)
+                norm_score = score / (L ** length_penalty)
+                finished_beams.append((seq, norm_score))
+
+            if not finished_beams:
+                finished_beams = [([sos_id, eos_id], -1e9)]
+
+            finished_beams.sort(key=lambda x: x[1], reverse=True)
+            best_seq = finished_beams[0][0]
+            final_seqs.append(best_seq)
+
+        # pad 成 tensor
+        max_l = max(len(s) for s in final_seqs)
+        out = torch.full((B, max_l), 0, dtype=torch.long, device=device)
+        for i, seq in enumerate(final_seqs):
+            out[i, :len(seq)] = torch.tensor(seq, device=device)
+        return out
