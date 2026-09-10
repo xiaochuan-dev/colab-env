@@ -105,6 +105,9 @@ class LatentGaussianPrior(nn.Module):
 
     def forward(self, decoder_state, H, W):
         # decoder_state: B d_model
+        # H, W 必须是 int（空间尺寸），不能是 Parameter
+        H = int(H)
+        W = int(W)
         params = self.mlp(decoder_state)
         mu = torch.sigmoid(params[:, :2])          # [0,1]
         sigma = F.softplus(params[:, 2:]) + 1e-4   # >0
@@ -265,20 +268,20 @@ class FusionHMERModel(nn.Module):
             seq = layer["norm3"](seq)
             seq = residual + layer["ffn"](seq)
 
-        return seq, (h, w)
+        return seq, (int(h), int(w))
 
     def _extract_kv(self, attn_module, x):
         """从 MultiheadAttention 中手动提取 K/V，用于缓存。
         返回 (key, value)，shape 均为 (B, L, D_model)。
         """
         D = x.size(-1)
-        w = attn_module.in_proj_weight
-        b = attn_module.in_proj_bias
+        weight = attn_module.in_proj_weight
+        bias = attn_module.in_proj_bias
         # Q 占 [0:D), K 占 [D:2D), V 占 [2D:3D)
-        w_k = w[D:2 * D]
-        w_v = w[2 * D:3 * D]
-        b_k = b[D:2 * D] if b is not None else None
-        b_v = b[2 * D:3 * D] if b is not None else None
+        w_k = weight[D:2 * D]
+        w_v = weight[2 * D:3 * D]
+        b_k = bias[D:2 * D] if bias is not None else None
+        b_v = bias[2 * D:3 * D] if bias is not None else None
         k = F.linear(x, w_k, b_k)
         v = F.linear(x, w_v, b_v)
         return k, v
@@ -297,7 +300,8 @@ class FusionHMERModel(nn.Module):
             x: (B, T_cur, D)
             new_past_kv: 仅当 use_cache=True 时返回
         """
-        h, w = spatial_shape
+        spat_h, spat_w = spatial_shape  # 避免与后面 weight 变量冲突
+        spat_h, spat_w = int(spat_h), int(spat_w)
         B, T, _ = tgt_emb.shape
         device = tgt_emb.device
 
@@ -329,10 +333,10 @@ class FusionHMERModel(nn.Module):
 
                 # Q 只来自当前 token
                 D = x.size(-1)
-                w = layer["self_attn"].in_proj_weight
-                b = layer["self_attn"].in_proj_bias
-                w_q = w[:D]
-                b_q = b[:D] if b is not None else None
+                weight = layer["self_attn"].in_proj_weight
+                bias = layer["self_attn"].in_proj_bias
+                w_q = weight[:D]
+                b_q = bias[:D] if bias is not None else None
                 q = F.linear(x, w_q, b_q)  # (B, T, D)
 
                 n_heads = layer["self_attn"].num_heads
@@ -382,10 +386,10 @@ class FusionHMERModel(nn.Module):
                     cross_k, cross_v = self._extract_kv(layer["cross_attn"], memory)
 
                 D = x.size(-1)
-                w = layer["cross_attn"].in_proj_weight
-                b = layer["cross_attn"].in_proj_bias
-                w_q = w[:D]
-                b_q = b[:D] if b is not None else None
+                weight = layer["cross_attn"].in_proj_weight
+                bias = layer["cross_attn"].in_proj_bias
+                w_q = weight[:D]
+                b_q = bias[:D] if bias is not None else None
                 q = F.linear(x, w_q, b_q)
 
                 n_heads = layer["cross_attn"].num_heads
@@ -409,7 +413,7 @@ class FusionHMERModel(nn.Module):
                 # LGP 注入（仅第一层）
                 if i == 0:
                     last_state = x[:, -1]
-                    g, mu, sigma = self.lgp(last_state, h, w)  # B L
+                    g, mu, sigma = self.lgp(last_state, spat_h, spat_w)  # B L
                     g = g.unsqueeze(1)  # B 1 L
                     memory_g = memory * g.transpose(1, 2)
                     cross_k_g, cross_v_g = self._extract_kv(layer["cross_attn"], memory_g)
@@ -426,7 +430,7 @@ class FusionHMERModel(nn.Module):
                 attn_out, _ = layer["cross_attn"](x, memory, memory, need_weights=False)
                 if i == 0:
                     last_state = x[:, -1]
-                    g, mu, sigma = self.lgp(last_state, h, w)
+                    g, mu, sigma = self.lgp(last_state, spat_h, spat_w)
                     g = g.unsqueeze(1)
                     memory_g = memory * g.transpose(1, 2)
                     attn_out2, _ = layer["cross_attn"](x, memory_g, memory_g, need_weights=False)
