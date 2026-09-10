@@ -50,6 +50,8 @@ def main():
     print(f"[Train] train batches={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
 
     # 3. Model
+
+    print(f"可用 GPU 数量: {torch.cuda.device_count()}")
     model = FusionHMERModel(vocab_size)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=[0, 1])
