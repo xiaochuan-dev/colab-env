@@ -452,36 +452,20 @@ class FusionHMERModel(nn.Module):
         return x
 
     
-    def forward(self, images, tgt_ids=None, mode="train", beam_size=None, max_len=None,
-            sos_id=1, eos_id=2, length_penalty=None):
+    def forward(self, images, tgt_ids):
         """
-        mode="train"    : 原来的 teacher-forcing（需要 tgt_ids）
-        mode="generate" : 走 beam/greedy 解码，返回 pred_ids
+        images: B 1 H W
+        tgt_ids: B T  (已含 <sos> ... <eos>)
         """
-        if mode == "train" or tgt_ids is not None:
-            # ===== 原来的训练逻辑完全不变 =====
-            memory, spatial_shape = self.encode(images)
+        memory, spatial_shape = self.encode(images)
 
-            # teacher forcing
-            tgt_emb = self.token_emb(tgt_ids[:, :-1]) + self.decoder_pos[:, :tgt_ids.size(1)-1]
-            tgt_emb = self.dropout(tgt_emb)
+        # teacher forcing
+        tgt_emb = self.token_emb(tgt_ids[:, :-1]) + self.decoder_pos[:, :tgt_ids.size(1)-1]
+        tgt_emb = self.dropout(tgt_emb)
 
-            out = self.decode_step(tgt_emb, memory, spatial_shape, use_cache=False)
-            logits = self.out_proj(out)
-            return logits
-
-        elif mode == "generate":
-            # 走原来的 generate
-            return self.generate(
-                images,
-                max_len=max_len if max_len is not None else MAX_DECODE_LEN,
-                sos_id=sos_id,
-                eos_id=eos_id,
-                beam_size=beam_size,
-                length_penalty=length_penalty
-            )
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+        out = self.decode_step(tgt_emb, memory, spatial_shape, use_cache=False)
+        logits = self.out_proj(out)
+        return logits
 
 
     @torch.no_grad()

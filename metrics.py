@@ -5,6 +5,8 @@ import editdistance
 from sacrebleu.metrics import BLEU
 from tqdm import tqdm
 from config import *
+from concurrent.futures import ThreadPoolExecutor
+import copy
 
 
 def normalize_latex(s: str) -> str:
@@ -69,46 +71,69 @@ def compute_exprate(refs, hyps, use_normalize=True):
     return correct / max(len(refs), 1) * 100.0
 
 
-def evaluate(model, dataloader, tokenizer, device, desc="Eval", beam_size=None):
-    """
-    关键 DataParallel 包装的 model，绝不解包。
-    通过 model(..., mode="generate") 让 DataParallel 自动把 batch 切到两张卡。
-    """
-    model.eval()
-    beam_size = beam_size if beam_size is not None else BEAM_SIZE
+def _generate_on_device(model, imgs, beam_size):
+    """模型已在对应 device 上"""
+    with torch.no_grad():
+        return model.generate(imgs, beam_size=beam_size).cpu()
 
-    all_refs = []
-    all_hyps = []
+
+def evaluate(model, dataloader, tokenizer, device, desc="Eval", beam_size=None):
+    # 只在这里解包一次，拿到干净的权重
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    base_model.eval()
+
+    beam_size = beam_size if beam_size is not None else BEAM_SIZE
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    use_multi = num_gpus >= 2
+
+    if use_multi:
+        # 两张卡各放一份完整模型（20M 参数，开销可忽略）
+        model0 = copy.deepcopy(base_model).to("cuda:0").eval()
+        model1 = copy.deepcopy(base_model).to("cuda:1").eval()
+    else:
+        model0 = base_model.to(device).eval()
+        model1 = None
+
+    all_refs, all_hyps = [], []
 
     with torch.no_grad():
         pbar = tqdm(dataloader, desc=desc, leave=True)
-        for imgs, ids, formulas in pbar:
-            imgs = imgs.to(device, non_blocking=True)
+        for imgs, _, formulas in pbar:
+            B = imgs.size(0)
 
-            # 关键 DataParallel 的 __call__ → 自动 scatter 到多卡
-            pred_ids = model(
-                imgs,
-                mode="generate",
-                beam_size=beam_size
-            )
+            if use_multi and B >= 2:
+                mid = (B + 1) // 2
+                imgs0 = imgs[:mid].to("cuda:0", non_blocking=True)
+                imgs1 = imgs[mid:].to("cuda:1", non_blocking=True)
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f0 = pool.submit(_generate_on_device, model0, imgs0, beam_size)
+                    f1 = pool.submit(_generate_on_device, model1, imgs1, beam_size)
+                    pred0 = f0.result()
+                    pred1 = f1.result()
+
+                pred_ids = torch.cat([pred0, pred1], dim=0)
+                cur_formulas = formulas[:mid] + formulas[mid:]
+            else:
+                imgs = imgs.to(device, non_blocking=True)
+                pred_ids = _generate_on_device(model0, imgs, beam_size)
+                cur_formulas = formulas
 
             for i in range(pred_ids.size(0)):
-                hyp = tokenizer.decode(pred_ids[i].cpu().tolist())
-                ref = formulas[i]
+                hyp = tokenizer.decode(pred_ids[i].tolist())
                 all_hyps.append(hyp)
-                all_refs.append(ref)
+                all_refs.append(cur_formulas[i])
 
             pbar.set_postfix(samples=len(all_refs))
 
-    bleu = compute_bleu(all_refs, all_hyps)
-    ed = compute_edit_distance(all_refs, all_hyps)
-    exprate = compute_exprate(all_refs, all_hyps, use_normalize=True)
-    exprate_raw = compute_exprate(all_refs, all_hyps, use_normalize=False)
+    if use_multi:
+        del model0, model1
+        torch.cuda.empty_cache()
 
     return {
-        "BLEU": bleu,
-        "EditDistance": ed,
-        "ExpRate": exprate,
-        "ExpRate_raw": exprate_raw,
+        "BLEU": compute_bleu(all_refs, all_hyps),
+        "EditDistance": compute_edit_distance(all_refs, all_hyps),
+        "ExpRate": compute_exprate(all_refs, all_hyps, use_normalize=True),
+        "ExpRate_raw": compute_exprate(all_refs, all_hyps, use_normalize=False),
         "num_samples": len(all_refs)
     }
