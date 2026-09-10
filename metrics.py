@@ -112,6 +112,15 @@ def evaluate(model, dataloader, tokenizer, device, desc="Eval", beam_size=None):
                     pred0 = f0.result()
                     pred1 = f1.result()
 
+                # pad 到相同长度再拼接
+                max_len = max(pred0.size(1), pred1.size(1))
+                if pred0.size(1) < max_len:
+                    pad = torch.zeros(pred0.size(0), max_len - pred0.size(1), dtype=pred0.dtype)
+                    pred0 = torch.cat([pred0, pad], dim=1)
+                if pred1.size(1) < max_len:
+                    pad = torch.zeros(pred1.size(0), max_len - pred1.size(1), dtype=pred1.dtype)
+                    pred1 = torch.cat([pred1, pad], dim=1)
+
                 pred_ids = torch.cat([pred0, pred1], dim=0)
                 cur_formulas = formulas[:mid] + formulas[mid:]
             else:
