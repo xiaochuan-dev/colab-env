@@ -27,7 +27,7 @@ USE_SPATIAL_SUPERVISION = False  # im2latex-100k 无 bbox，设为 False
 ENTITY_TOKENS = set()          # 运行时根据 vocab 填充（数字/字母/常见符号）
 
 # 训练
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 NUM_WORKERS = 4
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
