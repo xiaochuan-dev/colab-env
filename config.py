@@ -38,11 +38,11 @@ SEED = 42
 DEVICE = "cuda"                # 自动 fallback 到 cpu
 SAVE_DIR = "./checkpoints"
 LOG_INTERVAL = 50
-EVAL_INTERVAL = 5              # 每多少 epoch 评估一次
+EVAL_INTERVAL = 1              # 每多少 epoch 评估一次
 
 # 评估
 BEAM_SIZE = 5                  # beam search 宽度
-MAX_DECODE_LEN = 150
+MAX_DECODE_LEN = 120
 LENGTH_PENALTY = 0.6           # beam 长度惩罚 alpha
 
 # 路径

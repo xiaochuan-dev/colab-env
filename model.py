@@ -518,19 +518,44 @@ class FusionHMERModel(nn.Module):
     @torch.no_grad()
     def _generate_beam(self, images, max_len, sos_id, eos_id, beam_size, length_penalty):
         """
-        Beam Search + 每条 beam 独立 KV Cache。
-        每步只对最新 token 做 decode，避免整段重算。
-        验证建议单卡调用（DataParallel 时用 model.module）。
+        Beam Search + KV Cache，同一张图内 active beams 向量化成一次 forward。
+        仍按样本外层循环（实现简单、显存可控）。
         """
         memory, spatial_shape = self.encode(images)
         B = images.size(0)
         device = images.device
         final_seqs = []
 
-        for b in range(B):
-            mem_b = memory[b:b+1]  # (1, Lm, D)
+        def stack_past(past_list):
+            """list of past_kv (each: list[layer] of tuples) -> batched past_kv or None"""
+            if past_list[0] is None:
+                return None
+            n_layers = len(past_list[0])
+            batched = []
+            for li in range(n_layers):
+                self_k = torch.cat([p[li][0] for p in past_list], dim=0)
+                self_v = torch.cat([p[li][1] for p in past_list], dim=0)
+                cross_k = torch.cat([p[li][2] for p in past_list], dim=0)
+                cross_v = torch.cat([p[li][3] for p in past_list], dim=0)
+                batched.append((self_k, self_v, cross_k, cross_v))
+            return batched
 
-            # 每条 beam: seq(list[int]), score(float), past_kv
+        def split_past(batched_past, n):
+            """batched past_kv -> list of n past_kv"""
+            if batched_past is None:
+                return [None] * n
+            out = []
+            for i in range(n):
+                one = []
+                for li in range(len(batched_past)):
+                    sk, sv, ck, cv = batched_past[li]
+                    one.append((sk[i:i+1], sv[i:i+1], ck[i:i+1], cv[i:i+1]))
+                out.append(one)
+            return out
+
+        for b in range(B):
+            mem_b = memory[b:b+1]
+            # beams: seq, score, past_kv
             beams = [{"seq": [sos_id], "score": 0.0, "past_kv": None}]
             finished_beams = []
 
@@ -539,24 +564,30 @@ class FusionHMERModel(nn.Module):
                 if not active:
                     break
 
+                n = len(active)
+                # 向量化：一次 decode 所有 active beam
+                cur = torch.tensor([[bm["seq"][-1]] for bm in active], dtype=torch.long, device=device)
+                pos = len(active[0]["seq"]) - 1  # 同步长度
+                tgt_emb = self.token_emb(cur) + self.decoder_pos[:, pos:pos+1]
+                mem = mem_b.expand(n, -1, -1)
+                past = stack_past([bm["past_kv"] for bm in active])
+
+                hidden, new_past_batched = self.decode_step(
+                    tgt_emb, mem, spatial_shape,
+                    past_kv=past, use_cache=True
+                )
+                log_probs = F.log_softmax(self.out_proj(hidden[:, -1]), dim=-1)  # (n, V)
+                new_pasts = split_past(new_past_batched, n)
+
+                topk_logp, topk_ids = log_probs.topk(beam_size, dim=-1)  # (n, beam)
+
                 candidates = []
-                for bm in active:
-                    seq = bm["seq"]
-                    pos = len(seq) - 1
-                    cur = torch.tensor([[seq[-1]]], dtype=torch.long, device=device)
-                    tgt_emb = self.token_emb(cur) + self.decoder_pos[:, pos:pos + 1]
-
-                    hidden, new_past = self.decode_step(
-                        tgt_emb, mem_b, spatial_shape,
-                        past_kv=bm["past_kv"], use_cache=True
-                    )
-                    log_probs = F.log_softmax(self.out_proj(hidden[:, -1]), dim=-1)[0]
-                    topk_logp, topk_ids = log_probs.topk(beam_size)
-
-                    for logp, tid in zip(topk_logp.tolist(), topk_ids.tolist()):
-                        tid = int(tid)
-                        new_seq = seq + [tid]
-                        new_score = bm["score"] + float(logp)
+                for i, bm in enumerate(active):
+                    for k in range(beam_size):
+                        tid = int(topk_ids[i, k].item())
+                        logp = float(topk_logp[i, k].item())
+                        new_seq = bm["seq"] + [tid]
+                        new_score = bm["score"] + logp
                         if tid == eos_id:
                             L = max(len(new_seq) - 1, 1)
                             finished_beams.append(
@@ -566,7 +597,7 @@ class FusionHMERModel(nn.Module):
                             candidates.append({
                                 "seq": new_seq,
                                 "score": new_score,
-                                "past_kv": new_past,
+                                "past_kv": new_pasts[i],
                             })
 
                 candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -580,10 +611,8 @@ class FusionHMERModel(nn.Module):
                 finished_beams.append(
                     (bm["seq"], bm["score"] / (L ** length_penalty))
                 )
-
             if not finished_beams:
                 finished_beams = [([sos_id, eos_id], -1e9)]
-
             finished_beams.sort(key=lambda x: x[1], reverse=True)
             final_seqs.append(finished_beams[0][0])
 

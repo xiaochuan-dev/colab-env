@@ -60,6 +60,7 @@ def main():
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
 
     best_exprate = -1.0
+    print("[Train] val 使用 greedy(beam=1) 加速；最终 test 使用 BEAM_SIZE")
     global_step = 0
 
     for epoch in range(1, EPOCHS + 1):
@@ -92,7 +93,7 @@ def main():
 
         # 评估（beam search + normalization）
         if epoch % EVAL_INTERVAL == 0:
-            metrics = evaluate(model, val_loader, tokenizer, device, desc=f"Val Epoch {epoch}")
+            metrics = evaluate(model, val_loader, tokenizer, device, desc=f"Val Epoch {epoch}", beam_size=1)
             print(f"[Val] BLEU={metrics['BLEU']:.2f}  "
                   f"EditDist={metrics['EditDistance']:.4f}  "
                   f"ExpRate(norm)={metrics['ExpRate']:.2f}%  "
@@ -119,7 +120,7 @@ def main():
         model.module.load_state_dict(ckpt["model"])
     else:
         model.load_state_dict(ckpt["model"])
-    test_metrics = evaluate(model, test_loader, tokenizer, device, desc="Test")
+    test_metrics = evaluate(model, test_loader, tokenizer, device, desc="Test", beam_size=BEAM_SIZE)
     print(f"[Test] BLEU={test_metrics['BLEU']:.2f}  "
           f"EditDist={test_metrics['EditDistance']:.4f}  "
           f"ExpRate(norm)={test_metrics['ExpRate']:.2f}%  "
