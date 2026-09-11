@@ -138,15 +138,9 @@ def get_image_transform():
 
 
 class Im2LatexDataset(Dataset):
-    def __init__(self, split="train", tokenizer=None, transform=None, max_samples=None):
+    def __init__(self, split="train", tokenizer=None, transform=None):
         print(f"[Data] loading {DATASET_NAME} split={split} ...")
         self.ds = load_dataset(DATASET_NAME, split=split)
-
-        # 可选：限制样本数（快速调试时使用）
-        if max_samples is not None and max_samples < len(self.ds):
-            self.ds = self.ds.select(range(max_samples))
-            print(f"[Data] {split} truncated to {max_samples} samples")
-
         self.tokenizer = tokenizer
         self.transform = transform or get_image_transform()
 
@@ -179,15 +173,9 @@ def collate_fn(batch):
 
 
 def build_dataloaders(tokenizer):
-    # 全量数据（正式训练）
     train_ds = Im2LatexDataset("train", tokenizer)
-    val_ds   = Im2LatexDataset("val",   tokenizer)
-    test_ds  = Im2LatexDataset("test",  tokenizer)
-
-    # 如果还想临时限制数量，可以这样写：
-    # train_ds = Im2LatexDataset("train", tokenizer, max_samples=1000)
-    # val_ds   = Im2LatexDataset("val",   tokenizer, max_samples=200)
-    # test_ds  = Im2LatexDataset("test",  tokenizer, max_samples=200)
+    val_ds = Im2LatexDataset("val", tokenizer)
+    test_ds = Im2LatexDataset("test", tokenizer)
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,

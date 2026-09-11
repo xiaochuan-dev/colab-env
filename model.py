@@ -451,7 +451,6 @@ class FusionHMERModel(nn.Module):
             return x, new_past_kv
         return x
 
-    
     def forward(self, images, tgt_ids):
         """
         images: B 1 H W
@@ -467,15 +466,19 @@ class FusionHMERModel(nn.Module):
         logits = self.out_proj(out)
         return logits
 
-
     @torch.no_grad()
     def generate(self, images, max_len=MAX_DECODE_LEN, sos_id=1, eos_id=2,
-                beam_size=None, length_penalty=None):
+                 beam_size=None, length_penalty=None):
         """
-        解码入口（保持原实现）。
+        解码入口。
         beam_size<=1: 带 KV Cache 的贪心
         beam_size>1 : Beam Search（带长度惩罚）
+        输入会自动搬到与模型参数相同的 device，避免 DataParallel 多卡 mismatch。
         """
+        param_device = next(self.parameters()).device
+        if images.device != param_device:
+            images = images.to(param_device)
+
         beam_size = BEAM_SIZE if beam_size is None else beam_size
         length_penalty = LENGTH_PENALTY if length_penalty is None else length_penalty
 
@@ -515,82 +518,77 @@ class FusionHMERModel(nn.Module):
     @torch.no_grad()
     def _generate_beam(self, images, max_len, sos_id, eos_id, beam_size, length_penalty):
         """
-        标准 Beam Search。
-        为简化与正确性，对 batch 内每张图独立做 beam（避免复杂 mask）。
+        Beam Search + 每条 beam 独立 KV Cache。
+        每步只对最新 token 做 decode，避免整段重算。
+        验证建议单卡调用（DataParallel 时用 model.module）。
         """
         memory, spatial_shape = self.encode(images)
         B = images.size(0)
         device = images.device
-        V = self.vocab_size
-
-        # 最终输出 (B, L)
         final_seqs = []
 
         for b in range(B):
-            mem_b = memory[b:b+1]  # (1, Lmem, D)
-            # 每条 beam: (token_ids list, log_prob sum)
-            beams = [([sos_id], 0.0)]
+            mem_b = memory[b:b+1]  # (1, Lm, D)
+
+            # 每条 beam: seq(list[int]), score(float), past_kv
+            beams = [{"seq": [sos_id], "score": 0.0, "past_kv": None}]
             finished_beams = []
 
             for step in range(max_len):
-                candidates = []
-                # 收集未结束的 beam
-                active = [(seq, score) for seq, score in beams if seq[-1] != eos_id]
+                active = [bm for bm in beams if bm["seq"][-1] != eos_id]
                 if not active:
                     break
 
-                # 组 batch 前向
-                seqs = [seq for seq, _ in active]
-                max_t = max(len(s) for s in seqs)
-                # pad 到相同长度
-                inp = torch.full((len(seqs), max_t), 0, dtype=torch.long, device=device)
-                for i, seq in enumerate(seqs):
-                    inp[i, :len(seq)] = torch.tensor(seq, device=device)
+                candidates = []
+                for bm in active:
+                    seq = bm["seq"]
+                    pos = len(seq) - 1
+                    cur = torch.tensor([[seq[-1]]], dtype=torch.long, device=device)
+                    tgt_emb = self.token_emb(cur) + self.decoder_pos[:, pos:pos + 1]
 
-                # 扩展 memory
-                mem = mem_b.expand(len(seqs), -1, -1)
-                tgt_emb = self.token_emb(inp) + self.decoder_pos[:, :max_t]
-                hidden = self.decode_step(tgt_emb, mem, spatial_shape, use_cache=False)
-                logits = self.out_proj(hidden[:, -1])  # (n_active, V)
-                log_probs = F.log_softmax(logits, dim=-1)
+                    hidden, new_past = self.decode_step(
+                        tgt_emb, mem_b, spatial_shape,
+                        past_kv=bm["past_kv"], use_cache=True
+                    )
+                    log_probs = F.log_softmax(self.out_proj(hidden[:, -1]), dim=-1)[0]
+                    topk_logp, topk_ids = log_probs.topk(beam_size)
 
-                for i, (seq, score) in enumerate(active):
-                    topk_logp, topk_ids = log_probs[i].topk(beam_size)
                     for logp, tid in zip(topk_logp.tolist(), topk_ids.tolist()):
+                        tid = int(tid)
                         new_seq = seq + [tid]
-                        new_score = score + logp
+                        new_score = bm["score"] + float(logp)
                         if tid == eos_id:
-                            # 长度惩罚: score / L^alpha
                             L = max(len(new_seq) - 1, 1)
-                            norm_score = new_score / (L ** length_penalty)
-                            finished_beams.append((new_seq, norm_score))
+                            finished_beams.append(
+                                (new_seq, new_score / (L ** length_penalty))
+                            )
                         else:
-                            candidates.append((new_seq, new_score))
+                            candidates.append({
+                                "seq": new_seq,
+                                "score": new_score,
+                                "past_kv": new_past,
+                            })
 
-                # 保留 top beam_size 未完成
-                candidates.sort(key=lambda x: x[1], reverse=True)
+                candidates.sort(key=lambda x: x["score"], reverse=True)
                 beams = candidates[:beam_size]
 
-                # 若已有足够完成的，可提前停
                 if len(finished_beams) >= beam_size and not beams:
                     break
 
-            # 把还没结束的也按长度惩罚收进来
-            for seq, score in beams:
-                L = max(len(seq) - 1, 1)
-                norm_score = score / (L ** length_penalty)
-                finished_beams.append((seq, norm_score))
+            for bm in beams:
+                L = max(len(bm["seq"]) - 1, 1)
+                finished_beams.append(
+                    (bm["seq"], bm["score"] / (L ** length_penalty))
+                )
 
             if not finished_beams:
                 finished_beams = [([sos_id, eos_id], -1e9)]
 
             finished_beams.sort(key=lambda x: x[1], reverse=True)
-            best_seq = finished_beams[0][0]
-            final_seqs.append(best_seq)
+            final_seqs.append(finished_beams[0][0])
 
-        # pad 成 tensor
         max_l = max(len(s) for s in final_seqs)
         out = torch.full((B, max_l), 0, dtype=torch.long, device=device)
         for i, seq in enumerate(final_seqs):
-            out[i, :len(seq)] = torch.tensor(seq, device=device)
+            out[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
         return out
