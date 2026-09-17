@@ -1,6 +1,8 @@
 import os
+import glob
 import random
 import math
+import shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,18 +24,47 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def find_resume_ckpt(filename):
+    """在 /kaggle/input/ 下递归找指定文件名的 checkpoint"""
+    return glob.glob(f"/kaggle/input/**/{filename}", recursive=True)
+
+
 def main():
     set_seed(SEED)
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     print(f"[Train] device = {device}")
+    print(f"[Train] pwd = {os.getcwd()}")
+    print(f"[Train] SAVE_DIR = {SAVE_DIR}")
+
+    # 直接用 config 里的 SAVE_DIR，不写死
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    LAST_CKPT_PATH = os.path.join(SAVE_DIR, "last.pth")
+    BEST_CKPT_PATH = BEST_MODEL_PATH  # 就是 ./checkpoints/best_model.pt
+
+    # 自动在 /kaggle/input/ 下找挂载的旧 checkpoint
+    found_last = find_resume_ckpt("last.pth")
+    found_best = find_resume_ckpt("best_model.pt")
+    print(f"[Resume] found last.pth: {found_last}")
+    print(f"[Resume] found best_model.pt: {found_best}")
+
+    # 如果 working 里没有，就从挂载的 Dataset 复制过来
+    if not os.path.exists(LAST_CKPT_PATH):
+        if found_last:
+            shutil.copy(found_last[0], LAST_CKPT_PATH)
+            print(f"[Resume] copied {found_last[0]} -> {LAST_CKPT_PATH}")
+        elif found_best:
+            shutil.copy(found_best[0], LAST_CKPT_PATH)
+            print(f"[Resume] copied {found_best[0]} -> {LAST_CKPT_PATH}")
+
+    if not os.path.exists(BEST_CKPT_PATH) and found_best:
+        shutil.copy(found_best[0], BEST_CKPT_PATH)
+        print(f"[Resume] copied {found_best[0]} -> {BEST_CKPT_PATH}")
 
     # 1. Tokenizer
-    # 注意：改了 normalize 后建议删除旧 tokenizer.json 重新建词表
     if os.path.exists(TOKENIZER_PATH):
         tokenizer = LaTeXTokenizer()
         tokenizer.load(TOKENIZER_PATH)
         print(f"[Train] loaded tokenizer, vocab={len(tokenizer.token2id)}")
-        print("[Train] 若刚启用 normalize，建议删除 checkpoints/tokenizer.json 后重建")
     else:
         tokenizer = build_tokenizer_from_train()
 
@@ -48,7 +79,6 @@ def main():
     model = FusionHMERModel(vocab_size)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
-
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -56,14 +86,43 @@ def main():
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
 
-    best_exprate = -1.0
-    print("[Train] val 使用 greedy(beam=1) 加速；最终 test 使用 BEAM_SIZE")
+    # ========== 恢复训练 ==========
+    start_epoch = 1
     global_step = 0
+    best_exprate = -1.0
 
-    for epoch in range(1, EPOCHS + 1):
+    if os.path.exists(LAST_CKPT_PATH):
+        print(f"[Resume] loading checkpoint from {LAST_CKPT_PATH}")
+        ckpt = torch.load(LAST_CKPT_PATH, map_location=device)
+
+        state = ckpt["model"]
+        if isinstance(model, nn.DataParallel):
+            try:
+                model.module.load_state_dict(state)
+            except RuntimeError:
+                model.load_state_dict(state)
+        else:
+            model.load_state_dict(state)
+
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        best_exprate = ckpt.get("exprate", -1.0)
+        global_step = ckpt.get("global_step", 0)
+
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        else:
+            for _ in range(ckpt["epoch"]):
+                scheduler.step()
+
+        print(f"[Resume] resume from epoch {start_epoch}, best_exprate={best_exprate:.2f}")
+    else:
+        print("[Resume] no checkpoint found, training from scratch")
+
+    # ========== 训练循环 ==========
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         total_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
@@ -73,7 +132,7 @@ def main():
             ids = ids.to(device)
 
             optimizer.zero_grad()
-            logits = model(imgs, ids)  # B T-1 V
+            logits = model(imgs, ids)
             loss = criterion(
                 logits.reshape(-1, vocab_size),
                 ids[:, 1:].reshape(-1)
@@ -91,7 +150,21 @@ def main():
         avg_loss = total_loss / len(train_loader)
         print(f"[Epoch {epoch}] train loss = {avg_loss:.4f}")
 
-        # 评估（beam search + normalization）
+        state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
+        # 每轮都存 last.pth
+        torch.save({
+            "epoch": epoch,
+            "model": state,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "global_step": global_step,
+            "exprate": best_exprate,
+            "vocab_size": vocab_size,
+        }, LAST_CKPT_PATH)
+        print(f"[Save] last.pth saved (epoch={epoch}) -> {LAST_CKPT_PATH}")
+
+        # 评估 & 存 best
         if epoch % EVAL_INTERVAL == 0:
             metrics = evaluate(model, val_loader, tokenizer, device, desc=f"Val Epoch {epoch}", beam_size=1)
             print(f"[Val] BLEU={metrics['BLEU']:.2f}  "
@@ -102,20 +175,20 @@ def main():
 
             if metrics["ExpRate"] > best_exprate:
                 best_exprate = metrics["ExpRate"]
-                # DataParallel 时保存 module 的权重更干净
-                state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
                 torch.save({
                     "epoch": epoch,
                     "model": state,
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "global_step": global_step,
                     "exprate": best_exprate,
                     "vocab_size": vocab_size,
-                }, BEST_MODEL_PATH)
-                print(f"[Save] best model saved (ExpRate={best_exprate:.2f})")
+                }, BEST_CKPT_PATH)
+                print(f"[Save] best model saved (ExpRate={best_exprate:.2f}) -> {BEST_CKPT_PATH}")
 
-    # 最终测试
+    # ========== 最终测试 ==========
     print("\n[Test] loading best model and evaluating on test set ...")
-    ckpt = torch.load(BEST_MODEL_PATH, map_location=device)
+    ckpt = torch.load(BEST_CKPT_PATH, map_location=device)
     if isinstance(model, nn.DataParallel):
         model.module.load_state_dict(ckpt["model"])
     else:
