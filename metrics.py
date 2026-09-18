@@ -31,8 +31,10 @@ def normalize_latex(s: str) -> str:
 
 
 def latex_tokenize(formula: str):
-    """与 LaTeXTokenizer._tokenize 一致；先 normalize 再切。"""
+    """与 dataset.LaTeXTokenizer._tokenize 一致：优先空格分词。"""
     s = normalize_latex(formula)
+    if " " in s:
+        return [t for t in s.split() if t]
     tokens = []
     i = 0
     while i < len(s):
