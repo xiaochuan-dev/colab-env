@@ -1,10 +1,7 @@
 # ==================== 所有训练常量配置（无命令行参数） ====================
 import os
 
-# 数据集后端:
-#   "cleaned"    -> OleehyO/latex-formulas cleaned_formulas（推荐，~55万，HF 自动下载）
-#   "latex_ocr"  -> lukbl/LaTeX-OCR-dataset
-#   "hf_100k"    -> yuntian-deng/im2latex-100k
+# 数据集后端: cleaned / latex_ocr / hf_100k
 DATASET_BACKEND = "cleaned"
 
 LATEX_OCR_DATASET = "lukbl/LaTeX-OCR-dataset"
@@ -12,18 +9,21 @@ DATASET_NAME = "yuntian-deng/im2latex-100k"
 CLEANED_DATASET = "OleehyO/latex-formulas"
 CLEANED_CONFIG = "cleaned_formulas"
 
-# 最多使用的样本数（全量约 55 万；限制可省时间/显存压力）
-MAX_SAMPLES = 50000
+# 最多使用的样本数（全量约 55 万）
+MAX_SAMPLES = 60000
+# 剥 align* 外壳；仍过滤多行(\\\\)与嵌套环境
+FILTER_COMPLEX_ENV = True
+MAX_FORMULA_CHARS = 300
 
 MAX_FORMULA_LEN = 150
 IMG_SIZE = (128, 512)
 VOCAB_MIN_FREQ = 2
 
-D_MODEL = 256
+D_MODEL = 384
 N_HEADS = 8
-N_ENCODER_LAYERS = 3
-N_DECODER_LAYERS = 3
-D_FF = 1024
+N_ENCODER_LAYERS = 4
+N_DECODER_LAYERS = 4
+D_FF = 1536
 DROPOUT = 0.1
 MAX_SEQ_LEN = 160
 
@@ -35,7 +35,7 @@ LGP_LAMBDA = 0.1
 USE_SPATIAL_SUPERVISION = False
 ENTITY_TOKENS = set()
 
-BATCH_SIZE = 24
+BATCH_SIZE = 8
 NUM_WORKERS = 4
 LR = 2e-4
 WEIGHT_DECAY = 1e-4

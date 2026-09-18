@@ -1,4 +1,3 @@
-import os
 import re
 import json
 from collections import Counter
@@ -11,11 +10,32 @@ from PIL import Image
 from config import *
 
 
+# 多行/复杂环境：cleaned 里很多，当前模型不适合，默认过滤
+def strip_env(s: str) -> str:
+    """去掉外层 \\begin{xxx}...\\end{xxx}（cleaned 几乎全是 align*）。"""
+    if not s:
+        return s
+    # 反复剥最外层 begin/end
+    for _ in range(3):
+        m = re.match(
+            r"^\s*\\begin\s*\{[a-zA-Z*]+\}\s*([\s\S]*?)\s*\\end\s*\{[a-zA-Z*]+\}\s*$",
+            s,
+        )
+        if not m:
+            break
+        s = m.group(1).strip()
+    return s
+
+
 def normalize_latex(s: str) -> str:
+    """轻度规范化 + 剥 align* 外壳。"""
     if s is None:
         return ""
     s = s.strip()
+    s = strip_env(s)
+    s = s.replace("$$", " ").replace("$", " ")
     s = re.sub(r"\s+", " ", s)
+    # 单字符上下标补花括号
     s = re.sub(r"\^([^{\\\s])", r"^{\1}", s)
     s = re.sub(r"_([^{\\\s])", r"_{\1}", s)
     replacements = {
@@ -29,10 +49,99 @@ def normalize_latex(s: str) -> str:
         r"\varphi": r"\phi",
         r"\varepsilon": r"\epsilon",
         r"\varnothing": r"\emptyset",
+        r"\left": r"",
+        r"\right": r"",
+        r"\displaystyle": r"",
+        r"\limits": r"",
+        r"\mbox": r"\text",
+        r"{\rm ": r"\mathrm{",
+        r"\rm ": r"\mathrm ",
     }
     for a, b in replacements.items():
         s = s.replace(a, b)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def latex_tokenize(formula: str):
+    """
+    统一 LaTeX 分词（连续公式 / 空格公式都适用）:
+      \\alpha  \\,  \\{  以及单字符 { } _ ^ & = 等
+    """
+    s = formula.strip()
+    if not s:
+        return []
+    tokens = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 >= n:
+                tokens.append("\\")
+                i += 1
+                continue
+            nxt = s[i + 1]
+            if nxt.isalpha():
+                j = i + 1
+                while j < n and s[j].isalpha():
+                    j += 1
+                tokens.append(s[i:j])
+                i = j
+            else:
+                # \, \; \! \{ \} \| 等单符号命令
+                tokens.append(s[i : i + 2])
+                i += 2
+            continue
+        # 结构/运算符单字符
+        if ch in "{}()[]^_&=+-*/,.:;!|<>'~":
+            tokens.append(ch)
+            i += 1
+            continue
+        # 连续数字合成一个 token
+        if ch.isdigit():
+            j = i + 1
+            while j < n and s[j].isdigit():
+                j += 1
+            tokens.append(s[i:j])
+            i = j
+            continue
+        # 普通字母：单字符（避免把整段英文粘成稀有大 token）
+        tokens.append(ch)
+        i += 1
+    return tokens
+
+
+# 剥壳后仍含这些 → 多行/嵌套，仍过滤
+_COMPLEX_MARKERS = (
+    r"\begin",
+    r"\end",
+    r"\substack",
+    r"\\\\",  # align 多行
+)
+
+
+def is_good_formula(formula: str) -> bool:
+    if not formula or not formula.strip():
+        return False
+    # 先剥壳再判断
+    core = normalize_latex(formula)
+    if not core:
+        return False
+    if FILTER_COMPLEX_ENV:
+        low = core.lower()
+        if any(m in low for m in (r"\begin", r"\end", r"\substack")):
+            return False
+        # 多行 align（剥壳后仍有 \\）
+        if r"\\" in core:
+            return False
+    if len(core) > MAX_FORMULA_CHARS:
+        return False
+    if len(latex_tokenize(core)) < 1:
+        return False
+    return True
 
 
 class LaTeXTokenizer:
@@ -44,40 +153,20 @@ class LaTeXTokenizer:
     def build_vocab(self, formulas, min_freq=VOCAB_MIN_FREQ):
         counter = Counter()
         for f in formulas:
-            counter.update(self._tokenize(normalize_latex(f)))
+            counter.update(latex_tokenize(normalize_latex(f)))
         for tok, cnt in counter.most_common():
             if cnt >= min_freq and tok not in self.token2id:
                 idx = len(self.token2id)
                 self.token2id[tok] = idx
                 self.id2token[idx] = tok
         print(f"[Tokenizer] vocab size = {len(self.token2id)}")
+        # 统计 unk 风险：低频被丢掉的比例
+        total = sum(counter.values())
+        kept = sum(c for t, c in counter.items() if t in self.token2id)
+        print(f"[Tokenizer] token coverage = {kept / max(total, 1) * 100:.2f}%")
 
     def _tokenize(self, formula: str):
-        formula = formula.strip()
-        if " " in formula:
-            return [t for t in formula.split() if t]
-        tokens = []
-        i, s = 0, formula
-        while i < len(s):
-            if s[i].isspace():
-                i += 1
-                continue
-            if s[i] == "\\" and i + 1 < len(s):
-                j = i + 1
-                while j < len(s) and (s[j].isalpha() or s[j] in "^*_{}"):
-                    j += 1
-                tokens.append(s[i:j])
-                i = j
-            elif s[i] in "{}()[]^_":
-                tokens.append(s[i])
-                i += 1
-            else:
-                j = i + 1
-                while j < len(s) and not s[j].isspace() and s[j] not in "{}()[]^_\\":
-                    j += 1
-                tokens.append(s[i:j])
-                i = j
-        return tokens
+        return latex_tokenize(formula)
 
     def encode(self, formula, max_len=MAX_FORMULA_LEN):
         formula = normalize_latex(formula)
@@ -158,7 +247,7 @@ _CLEANED_SPLITS = None
 
 
 def _get_cleaned_splits():
-    """只下载一次 cleaned_formulas，可选截断到 MAX_SAMPLES，再 90/5/5 切分并缓存。"""
+    """下载 cleaned_formulas → 过滤复杂环境 → 截断 MAX_SAMPLES → 90/5/5。"""
     global _CLEANED_SPLITS
     if _CLEANED_SPLITS is not None:
         return _CLEANED_SPLITS
@@ -166,14 +255,23 @@ def _get_cleaned_splits():
 
     print(f"[Data] loading {CLEANED_DATASET}/{CLEANED_CONFIG} (once) ...")
     full = load_dataset(CLEANED_DATASET, CLEANED_CONFIG, split="train")
+    col = _text_column_name(full.column_names)
+    n0 = len(full)
+
+    if FILTER_COMPLEX_ENV:
+        def _ok(ex):
+            return is_good_formula(ex[col])
+
+        full = full.filter(_ok, num_proc=1)
+        print(f"[Data] after filter complex/long: {n0} -> {len(full)}")
+
     n = len(full)
     max_n = int(MAX_SAMPLES) if MAX_SAMPLES is not None else n
     if max_n < n:
-        # 固定种子打乱后取前 max_n，保证可复现
         full = full.shuffle(seed=SEED).select(range(max_n))
         print(f"[Data] limited samples: {n} -> {len(full)} (MAX_SAMPLES={max_n})")
     else:
-        print(f"[Data] using full samples: {n}")
+        print(f"[Data] using samples: {len(full)}")
 
     full = full.train_test_split(test_size=0.1, seed=SEED)
     rest = full["test"].train_test_split(test_size=0.5, seed=SEED)
@@ -190,12 +288,6 @@ def _get_cleaned_splits():
 
 
 class HFFormulaDataset(Dataset):
-    """
-    cleaned:   OleehyO/latex-formulas cleaned_formulas
-    latex_ocr: lukbl/LaTeX-OCR-dataset
-    hf_100k:   yuntian-deng/im2latex-100k
-    """
-
     def __init__(self, split="train", tokenizer=None, transform=None, backend=None):
         from datasets import load_dataset
 
@@ -314,7 +406,21 @@ def build_tokenizer_from_train():
     col = _text_column_name(ds.ds.column_names)
     formulas = ds.ds[col]
     print(f"[Data] collected {len(formulas)} formulas (column={col})")
+    # 打印一个分词样例，方便确认不是整句 <unk>
+    demo = normalize_latex(formulas[0])
+    print(f"[Data] tokenize demo: {demo[:80]}")
+    print(f"[Data] tokens: {latex_tokenize(demo)[:40]}")
     tok = LaTeXTokenizer()
     tok.build_vocab(formulas)
     tok.save(TOKENIZER_PATH)
+    # unk 率抽查
+    unk = tok.token2id["<unk>"]
+    rates = []
+    for f in list(formulas)[:500]:
+        ids = tok.encode(f)
+        body = ids[1:-1]
+        if body:
+            rates.append(sum(1 for x in body if x == unk) / len(body))
+    if rates:
+        print(f"[Tokenizer] avg unk rate on 500 samples = {sum(rates)/len(rates)*100:.2f}%")
     return tok
