@@ -12,6 +12,9 @@ DATASET_NAME = "yuntian-deng/im2latex-100k"
 CLEANED_DATASET = "OleehyO/latex-formulas"
 CLEANED_CONFIG = "cleaned_formulas"
 
+# 最多使用的样本数（全量约 55 万；限制可省时间/显存压力）
+MAX_SAMPLES = 50000
+
 MAX_FORMULA_LEN = 150
 IMG_SIZE = (128, 512)
 VOCAB_MIN_FREQ = 2
@@ -32,7 +35,7 @@ LGP_LAMBDA = 0.1
 USE_SPATIAL_SUPERVISION = False
 ENTITY_TOKENS = set()
 
-BATCH_SIZE = 16
+BATCH_SIZE = 24
 NUM_WORKERS = 4
 LR = 2e-4
 WEIGHT_DECAY = 1e-4

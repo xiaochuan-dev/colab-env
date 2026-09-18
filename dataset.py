@@ -158,7 +158,7 @@ _CLEANED_SPLITS = None
 
 
 def _get_cleaned_splits():
-    """只下载一次 cleaned_formulas，再 90/5/5 切分并缓存。"""
+    """只下载一次 cleaned_formulas，可选截断到 MAX_SAMPLES，再 90/5/5 切分并缓存。"""
     global _CLEANED_SPLITS
     if _CLEANED_SPLITS is not None:
         return _CLEANED_SPLITS
@@ -166,6 +166,15 @@ def _get_cleaned_splits():
 
     print(f"[Data] loading {CLEANED_DATASET}/{CLEANED_CONFIG} (once) ...")
     full = load_dataset(CLEANED_DATASET, CLEANED_CONFIG, split="train")
+    n = len(full)
+    max_n = int(MAX_SAMPLES) if MAX_SAMPLES is not None else n
+    if max_n < n:
+        # 固定种子打乱后取前 max_n，保证可复现
+        full = full.shuffle(seed=SEED).select(range(max_n))
+        print(f"[Data] limited samples: {n} -> {len(full)} (MAX_SAMPLES={max_n})")
+    else:
+        print(f"[Data] using full samples: {n}")
+
     full = full.train_test_split(test_size=0.1, seed=SEED)
     rest = full["test"].train_test_split(test_size=0.5, seed=SEED)
     _CLEANED_SPLITS = {
